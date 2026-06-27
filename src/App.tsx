@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import cytoscape from "cytoscape";
+import { useEffect, useMemo, useRef, useState } from "react";
+import ForceGraph2D, { type ForceGraphMethods } from "react-force-graph-2d";
 import "./App.css";
 
 type NodeInfo = {
@@ -35,18 +35,74 @@ type GraphSummary = {
   edges: number;
 };
 
+type GraphNode = NodeInfo & {
+  x?: number;
+  y?: number;
+};
+
+type GraphLink = EdgeInfo & {
+  source: string | GraphNode;
+  target: string | GraphNode;
+};
+
+type ForceGraphData = {
+  nodes: GraphNode[];
+  links: GraphLink[];
+};
+
+type FilterType =
+  | "All"
+  | "Core"
+  | "Paper"
+  | "Author"
+  | "Topic"
+  | "ReferencedPaper";
+
+const getNodeColor = (type: NodeInfo["type"]) => {
+  if (type === "Paper") return "#5b6cff";
+  if (type === "Author") return "#10b981";
+  if (type === "Topic") return "#f59e0b";
+  if (type === "ReferencedPaper") return "#71717a";
+  return "#ffffff";
+};
+
+const getNodeSize = (type: NodeInfo["type"]) => {
+  if (type === "Paper") return 6;
+  if (type === "ReferencedPaper") return 4.8;
+  if (type === "Topic") return 5.2;
+  return 5.2;
+};
+
+const getShortLabel = (label: string) => {
+  return label.length > 28 ? `${label.slice(0, 28)}...` : label;
+};
+
+const getLinkNodeId = (node: string | GraphNode) => {
+  return typeof node === "object" ? node.id : String(node);
+};
+
 function App() {
-  const graphRef = useRef<HTMLDivElement | null>(null);
-  const cyRef = useRef<cytoscape.Core | null>(null);
+  const graphRef = useRef<ForceGraphMethods | undefined>(undefined);
 
   const [selectedNode, setSelectedNode] = useState<NodeInfo | null>(null);
+  const [hoverNodeId, setHoverNodeId] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState("artificial intelligence");
   const [isLoading, setIsLoading] = useState(false);
   const [fromYear, setFromYear] = useState("2020");
+  const [resultLimit, setResultLimit] = useState("20");
   const [toYear, setToYear] = useState("2026");
+  const [activeFilter, setActiveFilter] = useState<FilterType>("All");
   const [statusMessage, setStatusMessage] = useState(
     "Real OpenAlex Oulu metadata connected"
   );
+
+  const [graphData, setGraphData] = useState<ForceGraphData>({
+    nodes: [],
+    links: [],
+  });
+
+  const [highlightNodes, setHighlightNodes] = useState<Set<string>>(new Set());
+  const [highlightLinks, setHighlightLinks] = useState<Set<string>>(new Set());
 
   const [graphSummary, setGraphSummary] = useState<GraphSummary>({
     papers: 0,
@@ -56,16 +112,43 @@ function App() {
     edges: 0,
   });
 
-  const loadGraph = async (query: string) => {
-    if (!graphRef.current) return;
+  const visibleGraphData = useMemo(() => {
+    if (activeFilter === "All") return graphData;
 
+    const visibleNodes = graphData.nodes.filter((node) => {
+      if (activeFilter === "Core") return node.type !== "ReferencedPaper";
+      return node.type === activeFilter;
+    });
+
+    const visibleNodeIds = new Set(visibleNodes.map((node) => node.id));
+
+    const visibleLinks = graphData.links.filter((link) => {
+      const sourceId = getLinkNodeId(link.source);
+      const targetId = getLinkNodeId(link.target);
+
+      if (activeFilter === "Core" && link.label === "CITES") return false;
+
+      return visibleNodeIds.has(sourceId) && visibleNodeIds.has(targetId);
+    });
+
+    return {
+      nodes: visibleNodes,
+      links: visibleLinks,
+    };
+  }, [activeFilter, graphData]);
+
+  const loadGraph = async (query: string) => {
     setIsLoading(true);
     setSelectedNode(null);
+    setHoverNodeId(null);
+    setActiveFilter("All");
+    setHighlightNodes(new Set());
+    setHighlightLinks(new Set());
     setStatusMessage("Loading University of Oulu publication graph...");
 
     try {
       const params = new URLSearchParams({
-        limit: "5",
+        limit: resultLimit,
         search: query.trim(),
         from_year: fromYear,
         to_year: toYear,
@@ -79,10 +162,10 @@ function App() {
         throw new Error("Failed to fetch graph data");
       }
 
-      const graphData: GraphResponse = await response.json();
+      const backendGraph: GraphResponse = await response.json();
 
-      if (graphData.nodes.length === 0) {
-        cyRef.current?.destroy();
+      if (backendGraph.nodes.length === 0) {
+        setGraphData({ nodes: [], links: [] });
         setGraphSummary({
           papers: 0,
           authors: 0,
@@ -94,228 +177,101 @@ function App() {
         return;
       }
 
+      setGraphData({
+        nodes: backendGraph.nodes,
+        links: backendGraph.edges,
+      });
+
       setGraphSummary({
-        papers: graphData.nodes.filter((node) => node.type === "Paper").length,
-        authors: graphData.nodes.filter((node) => node.type === "Author").length,
-        topics: graphData.nodes.filter((node) => node.type === "Topic").length,
-        citedPapers: graphData.nodes.filter(
+        papers: backendGraph.nodes.filter((node) => node.type === "Paper")
+          .length,
+        authors: backendGraph.nodes.filter((node) => node.type === "Author")
+          .length,
+        topics: backendGraph.nodes.filter((node) => node.type === "Topic")
+          .length,
+        citedPapers: backendGraph.nodes.filter(
           (node) => node.type === "ReferencedPaper"
         ).length,
-        edges: graphData.edges.length,
-      });
-
-      const backendElements: cytoscape.ElementDefinition[] = [
-        ...graphData.nodes.map((node) => ({
-          data: node,
-        })),
-        ...graphData.edges.map((edge) => ({
-          data: edge,
-        })),
-      ];
-
-      cyRef.current?.destroy();
-
-      cyRef.current = cytoscape({
-        container: graphRef.current,
-        elements: backendElements,
-        style: [
-          {
-            selector: "node",
-            style: {
-              label: "data(label)",
-              "text-wrap": "ellipsis",
-              "text-max-width": "75px",
-              "font-size": 9,
-              "text-valign": "center",
-              "text-halign": "center",
-              color: "#ffffff",
-              width: 90,
-              height: 90,
-              "border-width": 2,
-              "border-color": "#ffffff",
-            },
-          },
-          {
-            selector: 'node[type = "Paper"]',
-            style: {
-              "background-color": "#5b6cff",
-              shape: "round-rectangle",
-            },
-          },
-          {
-            selector: 'node[type = "ReferencedPaper"]',
-            style: {
-              "background-color": "#71717a",
-              shape: "round-rectangle",
-              width: 75,
-              height: 75,
-              "font-size": 8,
-              "text-max-width": "65px",
-            },
-          },
-          {
-            selector: 'node[type = "Author"]',
-            style: {
-              "background-color": "#10b981",
-              shape: "ellipse",
-            },
-          },
-          {
-            selector: 'node[type = "Topic"]',
-            style: {
-              "background-color": "#f59e0b",
-              shape: "hexagon",
-            },
-          },
-          {
-            selector: "edge",
-            style: {
-              label: "data(label)",
-              "font-size": 8,
-              color: "#9ca3af",
-              width: 2,
-              "line-color": "#6b7280",
-              "target-arrow-color": "#6b7280",
-              "target-arrow-shape": "triangle",
-              "curve-style": "bezier",
-            },
-          },
-          {
-            selector: ".faded",
-            style: {
-              opacity: 0.18,
-            },
-          },
-          {
-            selector: ".highlighted",
-            style: {
-              opacity: 1,
-              "border-width": 5,
-              "border-color": "#ffffff",
-              "line-color": "#ffffff",
-              "target-arrow-color": "#ffffff",
-              "z-index": 999,
-            },
-          },
-          {
-            selector: ":selected",
-            style: {
-              "border-color": "#ffffff",
-              "border-width": 5,
-              "line-color": "#ffffff",
-              "target-arrow-color": "#ffffff",
-            },
-          },
-        ],
-        layout: {
-          name: "cose",
-          animate: true,
-          fit: true,
-          padding: 80,
-          nodeRepulsion: 9000,
-          idealEdgeLength: 140,
-          edgeElasticity: 80,
-        },
-      });
-
-      const cy = cyRef.current;
-      if (!cy) return;
-
-      cy.on("tap", "node", (event) => {
-        const selected = event.target;
-        const neighborhood = selected.closedNeighborhood();
-
-        cy.elements().removeClass("highlighted faded");
-        cy.elements().not(neighborhood).addClass("faded");
-        neighborhood.addClass("highlighted");
-
-        setSelectedNode(selected.data() as NodeInfo);
-      });
-
-      cy.on("tap", (event) => {
-        if (event.target === cy) {
-          cy.elements().removeClass("highlighted faded");
-          setSelectedNode(null);
-        }
+        edges: backendGraph.edges.length,
       });
 
       setStatusMessage(
-        `Loaded ${graphData.nodes.length} nodes and ${graphData.edges.length} edges`
+        `Loaded ${backendGraph.nodes.length} nodes and ${backendGraph.edges.length} edges`
       );
     } catch (error) {
       console.error(error);
+      setGraphData({ nodes: [], links: [] });
+      setGraphSummary({
+        papers: 0,
+        authors: 0,
+        topics: 0,
+        citedPapers: 0,
+        edges: 0,
+      });
       setStatusMessage("Failed to load graph data");
     } finally {
       setIsLoading(false);
     }
   };
 
-  const filterGraph = (
-    type: "All" | "Core" | "Paper" | "Author" | "Topic" | "ReferencedPaper"
-  ) => {
-    const cy = cyRef.current;
-    if (!cy) return;
-
+  const filterGraph = (type: FilterType) => {
     setSelectedNode(null);
-    cy.elements().removeClass("highlighted faded");
-    cy.elements().style("display", "element");
+    setHoverNodeId(null);
+    setActiveFilter(type);
+    setHighlightNodes(new Set());
+    setHighlightLinks(new Set());
 
-    if (type === "Core") {
-      cy.nodes().forEach((node) => {
-        if (node.data("type") === "ReferencedPaper") {
-          node.style("display", "none");
-        }
-      });
+    window.setTimeout(() => {
+      graphRef.current?.zoomToFit(600, 90);
+    }, 300);
+  };
 
-      cy.edges().forEach((edge) => {
-        if (
-          edge.data("label") === "CITES" ||
-          !edge.source().visible() ||
-          !edge.target().visible()
-        ) {
-          edge.style("display", "none");
-        }
-      });
+  const handleNodeClick = (node: GraphNode) => {
+    const connectedNodeIds = new Set<string>([node.id]);
+    const connectedLinkIds = new Set<string>();
+
+    visibleGraphData.links.forEach((link) => {
+      const sourceId = getLinkNodeId(link.source);
+      const targetId = getLinkNodeId(link.target);
+
+      if (sourceId === node.id || targetId === node.id) {
+        connectedNodeIds.add(sourceId);
+        connectedNodeIds.add(targetId);
+        connectedLinkIds.add(link.id);
+      }
+    });
+
+    setSelectedNode(node);
+    setHighlightNodes(connectedNodeIds);
+    setHighlightLinks(connectedLinkIds);
+
+    if (node.x !== undefined && node.y !== undefined) {
+      graphRef.current?.centerAt(node.x, node.y, 500);
+      graphRef.current?.zoom(2.3, 500);
     }
+  };
 
-    if (type !== "All" && type !== "Core") {
-      cy.nodes().forEach((node) => {
-        if (node.data("type") !== type) {
-          node.style("display", "none");
-        }
-      });
-
-      cy.edges().forEach((edge) => {
-        if (!edge.source().visible() || !edge.target().visible()) {
-          edge.style("display", "none");
-        }
-      });
-    }
-
-    cy.fit(undefined, 80);
+  const resetHighlight = () => {
+    setSelectedNode(null);
+    setHoverNodeId(null);
+    setHighlightNodes(new Set());
+    setHighlightLinks(new Set());
+    graphRef.current?.zoomToFit(600, 90);
   };
 
   const exportPng = () => {
-    const cy = cyRef.current;
-    if (!cy) return;
+    const canvas = document.querySelector(".graph-view canvas");
 
-    const pngData = cy.png({
-      full: true,
-      scale: 2,
-      bg: "#09090b",
-    });
+    if (!(canvas instanceof HTMLCanvasElement)) return;
 
     const link = document.createElement("a");
-    link.href = pngData;
+    link.href = canvas.toDataURL("image/png");
     link.download = "aira-scholar-kg.png";
     link.click();
   };
 
   const exportJson = () => {
-    const cy = cyRef.current;
-    if (!cy) return;
-
-    const graphJson = JSON.stringify(cy.json().elements, null, 2);
+    const graphJson = JSON.stringify(graphData, null, 2);
     const blob = new Blob([graphJson], { type: "application/json" });
     const url = URL.createObjectURL(blob);
 
@@ -328,18 +284,46 @@ function App() {
   };
 
   useEffect(() => {
-    const timeoutId = window.setTimeout(() => {
-      void loadGraph(searchTerm);
-    }, 0);
+  const timeoutId = window.setTimeout(() => {
+    void loadGraph(searchTerm);
+  }, 0);
 
-    return () => {
-      window.clearTimeout(timeoutId);
-      cyRef.current?.destroy();
-    };
+  return () => {
+    window.clearTimeout(timeoutId);
+  };
 
-    // Run once on initial page load.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  // Run once on initial page load.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+}, []);
+
+  useEffect(() => {
+    const forceGraph = graphRef.current;
+
+    if (!forceGraph || visibleGraphData.nodes.length === 0) return;
+
+    const linkForce = forceGraph.d3Force("link") as
+      | {
+          distance?: (value: number) => void;
+          strength?: (value: number) => void;
+        }
+      | undefined;
+
+    const chargeForce = forceGraph.d3Force("charge") as
+      | {
+          strength?: (value: number) => void;
+        }
+      | undefined;
+
+    linkForce?.distance?.(55);
+    linkForce?.strength?.(0.16);
+    chargeForce?.strength?.(-45);
+
+    forceGraph.d3ReheatSimulation();
+
+    window.setTimeout(() => {
+      forceGraph.zoomToFit(700, 10);
+    }, 900);
+  }, [visibleGraphData]);
 
   return (
     <main className="app-shell">
@@ -423,6 +407,12 @@ function App() {
                 onChange={(event) => setToYear(event.target.value)}
                 placeholder="To year"
               />
+              <input
+                className="year-input"
+                value={resultLimit}
+                onChange={(event) => setResultLimit(event.target.value)}
+                placeholder="Limit"
+              />
 
               <button onClick={() => loadGraph(searchTerm)} disabled={isLoading}>
                 {isLoading ? "Loading..." : "Search"}
@@ -432,7 +422,117 @@ function App() {
         </header>
 
         <div className="workspace">
-          <div ref={graphRef} className="graph-view" />
+          <div className="graph-view">
+            <ForceGraph2D
+              ref={graphRef}
+              graphData={visibleGraphData}
+              nodeId="id"
+              nodeLabel={(node) => (node as GraphNode).label}
+              nodeVal={(node) => getNodeSize((node as GraphNode).type)}
+              nodeColor={(node) => {
+                const graphNode = node as GraphNode;
+
+                if (highlightNodes.size === 0) {
+                  return getNodeColor(graphNode.type);
+                }
+
+                return highlightNodes.has(graphNode.id)
+                  ? getNodeColor(graphNode.type)
+                  : "rgba(80, 80, 90, 0.2)";
+              }}
+              linkLabel={(link) => (link as GraphLink).label}
+              linkColor={(link) => {
+                const graphLink = link as GraphLink;
+
+                if (highlightLinks.size === 0) {
+                  return "rgba(156, 163, 175, 0.35)";
+                }
+
+                return highlightLinks.has(graphLink.id)
+                  ? "#ffffff"
+                  : "rgba(80, 80, 90, 0.12)";
+              }}
+              linkWidth={(link) =>
+                highlightLinks.has((link as GraphLink).id) ? 2.3 : 0.9
+              }
+              linkDirectionalArrowLength={(link) =>
+                highlightLinks.has((link as GraphLink).id) ? 5 : 3.2
+              }
+              linkDirectionalArrowRelPos={0.95}
+              linkDirectionalArrowColor={(link) => {
+                const graphLink = link as GraphLink;
+
+                if (highlightLinks.size === 0) {
+                  return "rgba(156, 163, 175, 0.35)";
+                }
+
+                return highlightLinks.has(graphLink.id)
+                  ? "#ffffff"
+                  : "rgba(80, 80, 90, 0.12)";
+              }}
+              linkCurvature={0.04}
+              backgroundColor="#09090b"
+              d3VelocityDecay={0.28}
+              cooldownTicks={260}
+              onEngineStop={() => graphRef.current?.zoomToFit(600, 10)}
+              onNodeClick={(node) => handleNodeClick(node as GraphNode)}
+              onNodeHover={(node) =>
+                setHoverNodeId(node ? (node as GraphNode).id : null)
+              }
+              onBackgroundClick={resetHighlight}
+              nodeCanvasObject={(node, ctx, globalScale) => {
+                const graphNode = node as GraphNode;
+                const x = graphNode.x ?? 0;
+                const y = graphNode.y ?? 0;
+
+                const isSelected = selectedNode?.id === graphNode.id;
+                const isHovered = hoverNodeId === graphNode.id;
+                const isHighlighted = highlightNodes.has(graphNode.id);
+                const isFaded =
+                  highlightNodes.size > 0 && !highlightNodes.has(graphNode.id);
+
+                const baseSize = getNodeSize(graphNode.type);
+                const nodeSize = baseSize * 2.4;
+
+                ctx.save();
+                ctx.globalAlpha = isFaded ? 0.18 : 1;
+                ctx.fillStyle = getNodeColor(graphNode.type);
+                ctx.strokeStyle = isSelected || isHovered ? "#ffffff" : "#d4d4d8";
+                ctx.lineWidth = isSelected || isHovered ? 2.6 : 1.3;
+
+                ctx.beginPath();
+
+                ctx.arc(x, y, nodeSize, 0, 2 * Math.PI, false);
+
+                ctx.fill();
+                ctx.stroke();
+
+                if ((isSelected || isHovered) && !isFaded) {
+                  const label = getShortLabel(graphNode.label);
+                  const fontSize = Math.max(10, 14 / globalScale);
+
+                  ctx.font = `600 ${fontSize}px Sans-Serif`;
+                  ctx.textAlign = "center";
+                  ctx.textBaseline = "middle";
+                  ctx.fillStyle = "#ffffff";
+                  ctx.fillText(label, x, y - nodeSize - 8 / globalScale);
+                }
+
+                ctx.restore();
+              }}
+              nodePointerAreaPaint={(node, color, ctx) => {
+                const graphNode = node as GraphNode;
+                const x = graphNode.x ?? 0;
+                const y = graphNode.y ?? 0;
+                const size = graphNode.type === "Paper" ? 24 : 20;
+
+                ctx.fillStyle = color;
+                ctx.beginPath();
+                ctx.arc(x, y, size, 0, 2 * Math.PI, false);
+                ctx.fill();
+              }}
+            />
+          </div>
 
           <aside className="details-panel">
             <h2>Node Details</h2>

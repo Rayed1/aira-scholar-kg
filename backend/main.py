@@ -3,9 +3,14 @@ from typing import Any
 
 import httpx
 from dotenv import load_dotenv
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+
+def chunk_list(items, chunk_size=25):
+    for index in range(0, len(items), chunk_size):
+        yield items[index : index + chunk_size]
+
 
 load_dotenv()
 
@@ -15,8 +20,6 @@ app = FastAPI(
     version="0.1.0",
 )
 
-# Allows the React frontend to call this backend during development.
-# Frontend may run on ports like 5173, 5174, or 5175.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -79,6 +82,7 @@ def get_sample_graph():
         ],
     }
 
+
 @app.get("/graph/openalex/oulu")
 async def get_oulu_openalex_graph(
     limit: int = 10,
@@ -87,6 +91,9 @@ async def get_oulu_openalex_graph(
     to_year: int | None = None,
 ):
     api_key = os.getenv("OPENALEX_API_KEY")
+
+    # OpenAlex per-page max is 100.
+    safe_limit = max(1, min(limit, 100))
 
     filters = ["authorships.institutions.ror:https://ror.org/03yj89h83"]
 
@@ -98,7 +105,7 @@ async def get_oulu_openalex_graph(
 
     params: dict[str, Any] = {
         "filter": ",".join(filters),
-        "per-page": limit,
+        "per-page": safe_limit,
     }
 
     if search:
@@ -109,7 +116,7 @@ async def get_oulu_openalex_graph(
     if api_key:
         params["api_key"] = api_key
 
-    async with httpx.AsyncClient(timeout=20.0) as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.get(
             "https://api.openalex.org/works",
             params=params,
@@ -133,6 +140,7 @@ async def get_oulu_openalex_graph(
 
         doi = work.get("doi")
         openalex_url = work.get("id")
+
         primary_location = work.get("primary_location") or {}
         source = primary_location.get("source") or {}
         venue = source.get("display_name") or "Unknown venue"
@@ -161,7 +169,9 @@ async def get_oulu_openalex_graph(
 
         for authorship in work.get("authorships", [])[:3]:
             author = authorship.get("author", {})
-            author_id = (author.get("id") or "").replace("https://openalex.org/", "")
+            author_id = (author.get("id") or "").replace(
+                "https://openalex.org/", ""
+            )
             author_name = author.get("display_name")
 
             if not author_id or not author_name:
@@ -220,27 +230,44 @@ async def get_oulu_openalex_graph(
     referenced_work_details = {}
 
     if referenced_ids:
-        ref_params: dict[str, Any] = {
-            "filter": f"openalex:{'|'.join(sorted(referenced_ids))}",
-            "per-page": min(len(referenced_ids), 50),
-            "select": "id,title,publication_year,cited_by_count,doi,primary_location",
-        }
+        unique_referenced_ids = sorted(referenced_ids)
 
-        if api_key:
-            ref_params["api_key"] = api_key
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            for ref_id_chunk in chunk_list(unique_referenced_ids, 25):
+                ref_params: dict[str, Any] = {
+                    "filter": f"openalex:{'|'.join(ref_id_chunk)}",
+                    "per-page": min(len(ref_id_chunk), 100),
+                    "select": (
+                        "id,title,publication_year,cited_by_count,"
+                        "doi,primary_location"
+                    ),
+                }
 
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            ref_response = await client.get(
-                "https://api.openalex.org/works",
-                params=ref_params,
-            )
-            ref_response.raise_for_status()
-            ref_data = ref_response.json()
+                if api_key:
+                    ref_params["api_key"] = api_key
 
-        for ref_work in ref_data.get("results", []):
-            ref_id = ref_work.get("id", "").replace("https://openalex.org/", "")
-            if ref_id:
-                referenced_work_details[ref_id] = ref_work
+                ref_response = await client.get(
+                    "https://api.openalex.org/works",
+                    params=ref_params,
+                )
+
+                if ref_response.status_code != 200:
+                    print(
+                        "OpenAlex referenced-paper fetch failed:",
+                        ref_response.status_code,
+                    )
+                    print(ref_response.text)
+                    continue
+
+                ref_data = ref_response.json()
+
+                for ref_work in ref_data.get("results", []):
+                    ref_id = ref_work.get("id", "").replace(
+                        "https://openalex.org/", ""
+                    )
+
+                    if ref_id:
+                        referenced_work_details[ref_id] = ref_work
 
     for paper_id, ref_ids in paper_to_references.items():
         for ref_id in ref_ids:
