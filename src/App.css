@@ -1204,3 +1204,239 @@ body {
   opacity: 0.4;
   cursor: not-allowed;
 }
+
+/* ── Review List ─────────────────────────────────────────────── */
+
+.rl-section {
+  padding-bottom: 4px;
+}
+
+.rl-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  cursor: pointer;
+  user-select: none;
+}
+
+.rl-header:hover .section-label {
+  color: #a1a1aa;
+}
+
+.rl-toggle {
+  font-size: 10px;
+  color: #52525b;
+}
+
+.rl-body {
+  margin-top: 8px;
+}
+
+.rl-empty {
+  color: #52525b;
+  font-size: 11px;
+  line-height: 1.5;
+  margin: 0;
+}
+
+.rl-papers {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 320px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: #27272a transparent;
+  margin-bottom: 8px;
+}
+
+.rl-paper {
+  background: #111115;
+  border: 1px solid #1e1e23;
+  border-radius: 7px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.rl-paper-title {
+  color: #d4d4d8;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.4;
+  margin: 0;
+}
+
+.rl-paper-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.rl-paper-meta span {
+  color: #71717a;
+  font-size: 10px;
+}
+
+.rl-paper-links {
+  display: flex;
+  gap: 8px;
+}
+
+.rl-link {
+  color: #5b6cff;
+  font-size: 10px;
+  text-decoration: none;
+}
+
+.rl-link:hover {
+  text-decoration: underline;
+}
+
+.rl-remove-btn {
+  align-self: flex-start;
+  background: transparent;
+  border: 1px solid #3f3f46;
+  border-radius: 5px;
+  color: #71717a;
+  font-size: 10px;
+  padding: 2px 7px;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+  font-family: inherit;
+}
+
+.rl-remove-btn:hover {
+  color: #f87171;
+  border-color: #f87171;
+}
+
+.rl-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.rl-export-btn {
+  flex: 1;
+  background: #18181b;
+  border: 1px solid #27272a;
+  border-radius: 6px;
+  color: #a1a1aa;
+  font-size: 11px;
+  font-weight: 500;
+  padding: 5px 8px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+  font-family: inherit;
+  white-space: nowrap;
+}
+
+.rl-export-btn:hover {
+  background: #27272a;
+  color: #f4f4f5;
+}
+
+.rl-clear-btn {
+  flex: 1;
+  background: transparent;
+  border: 1px solid #3f3f46;
+  border-radius: 6px;
+  color: #71717a;
+  font-size: 11px;
+  font-weight: 500;
+  padding: 5px 8px;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+  font-family: inherit;
+  white-space: nowrap;
+}
+
+/* ── Citation & Connection Explanation ─────────────────────────────────── */
+
+.cite-explain-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.cite-subsection {
+  border-left: 2px solid #3f3f46;
+  padding-left: 8px;
+}
+
+.cite-section-subtitle {
+  font-size: 10px;
+  font-weight: 600;
+  color: #71717a;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin: 0 0 5px 0;
+}
+
+.cite-connection-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-bottom: 4px;
+  flex-wrap: wrap;
+}
+
+.cite-connection-name {
+  font-size: 12px;
+  color: #d4d4d8;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cite-reason-tag {
+  font-size: 10px;
+  color: #a1a1aa;
+  background: #1c1c1f;
+  border: 1px solid #3f3f46;
+  border-radius: 4px;
+  padding: 1px 5px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.rl-clear-btn:hover {
+  color: #f87171;
+  border-color: #f87171;
+}
+
+/* "Add to Review List" button inside Paper Insight panel */
+.rl-add-btn {
+  width: 100%;
+  background: #18181b;
+  border: 1px solid #27272a;
+  border-radius: 7px;
+  color: #a1a1aa;
+  font-size: 11px;
+  font-weight: 500;
+  padding: 6px 12px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+  font-family: inherit;
+  margin: 6px 0;
+  text-align: center;
+}
+
+.rl-add-btn:hover:not(:disabled) {
+  background: #1e1e2a;
+  border-color: #5b6cff;
+  color: #c7d2fe;
+}
+
+.rl-add-btn.rl-added,
+.rl-add-btn:disabled {
+  color: #10b981;
+  border-color: #064e3b;
+  background: #022c22;
+  cursor: default;
+  opacity: 1;
+}

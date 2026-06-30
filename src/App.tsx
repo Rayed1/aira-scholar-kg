@@ -129,6 +129,7 @@ type PaperInsightRef = {
   doi: string | null;
   url: string | null;
   venue: string | null;
+  connection_reasons?: string[];
 };
 
 type FullTextResult = {
@@ -160,6 +161,7 @@ type PaperInsight = {
   abstract: string | null;
   referenced_works_count: number;
   referenced_works: PaperInsightRef[];
+  citing_works: PaperInsightRef[];
 };
 
 // ── Chat types ──────────────────────────────────────────────────────────────
@@ -251,6 +253,10 @@ function App() {
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
   const [isChatCollapsed, setIsChatCollapsed] = useState(false);
+
+  // ── Review List state ──────────────────────────────────
+  const [reviewList, setReviewList] = useState<PaperInsight[]>([]);
+  const [reviewListOpen, setReviewListOpen] = useState(false);
 
   // ── Derived graph data ─────────────────────────────────────
 
@@ -552,6 +558,72 @@ function App() {
     URL.revokeObjectURL(url);
   };
 
+  // ── Review List ────────────────────────────────────────────
+
+  const addToReviewList = (paper: PaperInsight) => {
+    setReviewList((prev) =>
+      prev.some((p) => p.id === paper.id) ? prev : [...prev, paper]
+    );
+  };
+
+  const removeFromReviewList = (id: string) => {
+    setReviewList((prev) => prev.filter((p) => p.id !== id));
+  };
+
+  const clearReviewList = () => setReviewList([]);
+
+  const exportReviewMarkdown = () => {
+    const sections = reviewList.map((p, i) => {
+      const authors = p.authors.map((a) => a.name).join(", ");
+      const topics = p.topics.map((t) => t.name).join(", ");
+      return [
+        `## ${i + 1}. ${p.title}`,
+        `- **Year:** ${p.publication_year ?? "N/A"}`,
+        `- **Authors:** ${authors || "N/A"}`,
+        `- **Venue:** ${p.venue ?? "N/A"}`,
+        `- **Citations:** ${p.cited_by_count}`,
+        `- **Topics:** ${topics || "N/A"}`,
+        `- **DOI:** ${p.doi ?? "N/A"}`,
+        `- **OpenAlex:** ${p.openalex_url ?? "N/A"}`,
+        `- **Type:** ${p.type ?? "N/A"}`,
+      ].join("\n");
+    });
+    const md = `# AIRA Scholar – Review List\n\n${sections.join("\n\n")}`;
+    const blob = new Blob([md], { type: "text/markdown" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "aira-review-list.md";
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const exportReviewCsv = () => {
+    const header = "Title,Year,Authors,Venue,Citations,Topics,DOI,OpenAlex URL,Source type";
+    const esc = (s: string) => `"${s.replace(/"/g, '""')}"`;
+    const rows = reviewList.map((p) =>
+      [
+        esc(p.title),
+        p.publication_year ?? "",
+        esc(p.authors.map((a) => a.name).join("; ")),
+        esc(p.venue ?? ""),
+        p.cited_by_count,
+        esc(p.topics.map((t) => t.name).join("; ")),
+        esc(p.doi ?? ""),
+        esc(p.openalex_url ?? ""),
+        esc(p.type ?? ""),
+      ].join(",")
+    );
+    const csv = [header, ...rows].join("\n");
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "aira-review-list.csv";
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
   // ── Chat ───────────────────────────────────────────────────
 
   const suggestedQuestions = useMemo((): string[] => {
@@ -763,6 +835,53 @@ function App() {
             <button className="export-btn" onClick={exportPng}>Export PNG</button>
             <button className="export-btn" onClick={exportJson}>Export JSON</button>
           </div>
+        </div>
+
+        <div className="sidebar-section rl-section">
+          <div className="rl-header" onClick={() => setReviewListOpen((o) => !o)}>
+            <h3 className="section-label">Review List ({reviewList.length})</h3>
+            <span className="rl-toggle">{reviewListOpen ? "▲" : "▼"}</span>
+          </div>
+          {reviewListOpen && (
+            <div className="rl-body">
+              {reviewList.length === 0 ? (
+                <p className="rl-empty">No papers added yet. Open a paper and click "+ Add to Review List".</p>
+              ) : (
+                <>
+                  <div className="rl-papers">
+                    {reviewList.map((p) => (
+                      <div key={p.id} className="rl-paper">
+                        <p className="rl-paper-title">{p.title}</p>
+                        <div className="rl-paper-meta">
+                          {p.publication_year && <span>{p.publication_year}</span>}
+                          {p.venue && <span>{p.venue}</span>}
+                          <span>{p.cited_by_count} cited</span>
+                        </div>
+                        {(p.doi || p.openalex_url) && (
+                          <div className="rl-paper-links">
+                            {p.doi && (
+                              <a className="rl-link" href={p.doi} target="_blank" rel="noreferrer">DOI ↗</a>
+                            )}
+                            {p.openalex_url && (
+                              <a className="rl-link" href={p.openalex_url} target="_blank" rel="noreferrer">OA ↗</a>
+                            )}
+                          </div>
+                        )}
+                        <button className="rl-remove-btn" onClick={() => removeFromReviewList(p.id)}>
+                          ✕ Remove
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="rl-actions">
+                    <button className="rl-export-btn" onClick={exportReviewMarkdown}>MD ↓</button>
+                    <button className="rl-export-btn" onClick={exportReviewCsv}>CSV ↓</button>
+                    <button className="rl-clear-btn" onClick={clearReviewList}>Clear All</button>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
         </div>
       </aside>
 
@@ -1087,6 +1206,20 @@ function App() {
                           );
                         })()}
 
+                        {/* Add to Review List */}
+                        {(() => {
+                          const alreadyAdded = reviewList.some((p) => p.id === paperInsight.id);
+                          return (
+                            <button
+                              className={`rl-add-btn${alreadyAdded ? " rl-added" : ""}`}
+                              disabled={alreadyAdded}
+                              onClick={() => addToReviewList(paperInsight)}
+                            >
+                              {alreadyAdded ? "✓ In Review List" : "+ Add to Review List"}
+                            </button>
+                          );
+                        })()}
+
                         {/* Venue */}
                         {paperInsight.venue && (
                           <div className="ai-block">
@@ -1155,6 +1288,149 @@ function App() {
                             </ol>
                           </div>
                         )}
+
+                        {/* Citation & Connection Explanation */}
+                        {(() => {
+                          const pid = paperInsight.id;
+
+                          // Graph: papers this paper cites
+                          const graphCites = visibleGraphData.links
+                            .filter(l => getLinkNodeId(l.source) === pid && l.label === "CITES")
+                            .map(l => visibleGraphData.nodes.find(n => n.id === getLinkNodeId(l.target)))
+                            .filter((n): n is GraphNode => n !== undefined);
+
+                          // Graph: papers that cite this paper
+                          const graphCitedBy = visibleGraphData.links
+                            .filter(l => getLinkNodeId(l.target) === pid && l.label === "CITES")
+                            .map(l => visibleGraphData.nodes.find(n => n.id === getLinkNodeId(l.source)))
+                            .filter((n): n is GraphNode => n !== undefined);
+
+                          // Shared authors (deduplicated by paper)
+                          const myAuthorIds = visibleGraphData.links
+                            .filter(l => getLinkNodeId(l.target) === pid && l.label === "AUTHOR_OF")
+                            .map(l => getLinkNodeId(l.source));
+                          const sharedAuthorMap = new Map<string, { label: string; authors: string[] }>();
+                          myAuthorIds.forEach(authorId => {
+                            const authorNode = visibleGraphData.nodes.find(n => n.id === authorId);
+                            if (!authorNode) return;
+                            visibleGraphData.links
+                              .filter(l => getLinkNodeId(l.source) === authorId && l.label === "AUTHOR_OF" && getLinkNodeId(l.target) !== pid)
+                              .forEach(l => {
+                                const otherId = getLinkNodeId(l.target);
+                                const paperNode = visibleGraphData.nodes.find(n => n.id === otherId);
+                                if (!paperNode) return;
+                                const existing = sharedAuthorMap.get(otherId);
+                                if (existing) existing.authors.push(authorNode.label);
+                                else sharedAuthorMap.set(otherId, { label: paperNode.label, authors: [authorNode.label] });
+                              });
+                          });
+                          const sharedAuthors = [...sharedAuthorMap.entries()].slice(0, 4);
+
+                          // Shared topics (deduplicated by paper)
+                          const myTopicIds = visibleGraphData.links
+                            .filter(l => getLinkNodeId(l.source) === pid && l.label === "HAS_TOPIC")
+                            .map(l => getLinkNodeId(l.target));
+                          const sharedTopicMap = new Map<string, { label: string; topics: string[] }>();
+                          myTopicIds.forEach(topicId => {
+                            const topicNode = visibleGraphData.nodes.find(n => n.id === topicId);
+                            if (!topicNode) return;
+                            visibleGraphData.links
+                              .filter(l => getLinkNodeId(l.target) === topicId && l.label === "HAS_TOPIC" && getLinkNodeId(l.source) !== pid)
+                              .forEach(l => {
+                                const otherId = getLinkNodeId(l.source);
+                                const paperNode = visibleGraphData.nodes.find(n => n.id === otherId);
+                                if (!paperNode) return;
+                                const existing = sharedTopicMap.get(otherId);
+                                if (existing) existing.topics.push(topicNode.label);
+                                else sharedTopicMap.set(otherId, { label: paperNode.label, topics: [topicNode.label] });
+                              });
+                          });
+                          const sharedTopics = [...sharedTopicMap.entries()].slice(0, 4);
+
+                          const citingWorks = paperInsight.citing_works ?? [];
+                          const hasAny = graphCites.length > 0 || graphCitedBy.length > 0 ||
+                            sharedAuthors.length > 0 || sharedTopics.length > 0 || citingWorks.length > 0;
+
+                          return (
+                            <div className="ai-block">
+                              <span className="ai-block-label">Citation & Connection Explanation</span>
+                              {!hasAny ? (
+                                <p className="ai-status">No citation relationships loaded for this paper.</p>
+                              ) : (
+                                <div className="cite-explain-body">
+                                  {graphCites.length > 0 && (
+                                    <div className="cite-subsection">
+                                      <p className="cite-section-subtitle">Cites in graph ({graphCites.length})</p>
+                                      {graphCites.map((n, i) => (
+                                        <div key={i} className="cite-connection-row">
+                                          <span className="cite-connection-name">{n.label}</span>
+                                          <span className="cite-reason-tag">↗ cites</span>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  )}
+                                  {graphCitedBy.length > 0 && (
+                                    <div className="cite-subsection">
+                                      <p className="cite-section-subtitle">Cited by in graph ({graphCitedBy.length})</p>
+                                      {graphCitedBy.map((n, i) => (
+                                        <div key={i} className="cite-connection-row">
+                                          <span className="cite-connection-name">{n.label}</span>
+                                          <span className="cite-reason-tag">↙ cites this</span>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  )}
+                                  {sharedAuthors.length > 0 && (
+                                    <div className="cite-subsection">
+                                      <p className="cite-section-subtitle">Shared author connections ({sharedAuthors.length})</p>
+                                      {sharedAuthors.map(([, item], i) => (
+                                        <div key={i} className="cite-connection-row">
+                                          <span className="cite-connection-name">{item.label}</span>
+                                          <span className="cite-reason-tag">Shares author: {item.authors.join(", ")}</span>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  )}
+                                  {sharedTopics.length > 0 && (
+                                    <div className="cite-subsection">
+                                      <p className="cite-section-subtitle">Shared topic connections ({sharedTopics.length})</p>
+                                      {sharedTopics.map(([, item], i) => (
+                                        <div key={i} className="cite-connection-row">
+                                          <span className="cite-connection-name">{item.label}</span>
+                                          <span className="cite-reason-tag">Shares topic: {item.topics.join(", ")}</span>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  )}
+                                  {citingWorks.length > 0 && (
+                                    <div className="cite-subsection">
+                                      <p className="cite-section-subtitle">Citing papers from OpenAlex ({citingWorks.length})</p>
+                                      <ol className="ai-work-list">
+                                        {citingWorks.map((w, i) => (
+                                          <li key={i} className="ai-work-item">
+                                            <p className="ai-work-title">{w.title}</p>
+                                            <div className="ai-work-meta">
+                                              {w.year && <span>{w.year}</span>}
+                                              <span>{w.cited_by_count} cited</span>
+                                              {w.venue && <span>{w.venue}</span>}
+                                            </div>
+                                            <span className="cite-reason-tag">Cites this paper</span>
+                                            {(w.doi || w.url) && (
+                                              <div className="ai-work-links">
+                                                {w.doi && <a className="ai-work-link" href={w.doi} target="_blank" rel="noreferrer">DOI ↗</a>}
+                                                {w.url && <a className="ai-work-link" href={w.url} target="_blank" rel="noreferrer">OA ↗</a>}
+                                              </div>
+                                            )}
+                                          </li>
+                                        ))}
+                                      </ol>
+                                    </div>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })()}
                       </>
                     )}
                   </div>

@@ -494,10 +494,12 @@ async def get_paper_insight(work_id: str):
     # Abstract from inverted index
     abstract = reconstruct_abstract(work.get("abstract_inverted_index")) or None
 
-    # Referenced works — fetch details for first 5
+    paper_year = work.get("publication_year")
+
+    # Referenced works — fetch details for first 10
     ref_ids = [
         url.replace("https://openalex.org/", "")
-        for url in (work.get("referenced_works") or [])[:5]
+        for url in (work.get("referenced_works") or [])[:10]
     ]
     referenced_works: list[Any] = []
     if ref_ids:
@@ -505,7 +507,7 @@ async def get_paper_insight(work_id: str):
             ref_params: dict[str, Any] = {
                 **base_params,
                 "filter": f"openalex:{'|'.join(ref_ids)}",
-                "per-page": 5,
+                "per-page": 10,
                 "select": "id,title,publication_year,cited_by_count,doi,primary_location",
             }
             ref_resp = await client.get(
@@ -516,21 +518,65 @@ async def get_paper_insight(work_id: str):
                 for ref in ref_resp.json().get("results", []):
                     ref_primary = ref.get("primary_location") or {}
                     ref_source = ref_primary.get("source") or {}
+                    ref_venue = ref_source.get("display_name")
+                    ref_year = ref.get("publication_year")
+
+                    reasons: list[str] = ["This paper cites this work."]
+                    if ref_venue and ref_venue == venue:
+                        reasons.append(f"Same venue: {ref_venue}.")
+                    if paper_year and ref_year and abs(paper_year - ref_year) <= 2:
+                        reasons.append(f"Published in nearby years ({ref_year} vs {paper_year}).")
+
                     referenced_works.append(
                         {
                             "title": ref.get("title") or "Untitled",
-                            "year": ref.get("publication_year"),
+                            "year": ref_year,
                             "cited_by_count": ref.get("cited_by_count", 0),
                             "doi": ref.get("doi"),
                             "url": ref.get("id"),
-                            "venue": ref_source.get("display_name"),
+                            "venue": ref_venue,
+                            "connection_reasons": reasons,
                         }
                     )
+
+    # Citing works — papers that cite this one (max 5, sorted by citation count)
+    citing_works: list[Any] = []
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            cite_params: dict[str, Any] = {
+                **base_params,
+                "filter": f"cites:{work_id}",
+                "per-page": 5,
+                "select": "id,title,publication_year,cited_by_count,doi,primary_location",
+                "sort": "cited_by_count:desc",
+            }
+            cite_resp = await client.get(
+                "https://api.openalex.org/works",
+                params=cite_params,
+            )
+            if cite_resp.status_code == 200:
+                for cw in cite_resp.json().get("results", []):
+                    cw_primary = cw.get("primary_location") or {}
+                    cw_source = cw_primary.get("source") or {}
+                    citing_works.append(
+                        {
+                            "title": cw.get("title") or "Untitled",
+                            "year": cw.get("publication_year"),
+                            "cited_by_count": cw.get("cited_by_count", 0),
+                            "doi": cw.get("doi"),
+                            "url": cw.get("id"),
+                            "venue": cw_source.get("display_name"),
+                            "connection_reasons": ["Cites the selected paper."],
+                        }
+                    )
+    except Exception as exc:
+        print(f"Citing works fetch skipped for {work_id}: {type(exc).__name__}")
+        # citing_works stays empty — graceful degradation
 
     return {
         "id": work_id,
         "title": work.get("title") or "Untitled",
-        "publication_year": work.get("publication_year"),
+        "publication_year": paper_year,
         "publication_date": work.get("publication_date"),
         "type": work.get("type"),
         "language": work.get("language"),
@@ -548,6 +594,7 @@ async def get_paper_insight(work_id: str):
         "abstract": abstract,
         "referenced_works_count": len(work.get("referenced_works") or []),
         "referenced_works": referenced_works,
+        "citing_works": citing_works,
     }
 
 
@@ -674,28 +721,30 @@ _SYSTEM_PROMPT = """\
 You are AIRA Assistant, a research assistant for an academic knowledge graph.
 Answer ONLY from the provided GRAPH CONTEXT. Be concise: 2–3 sentences maximum.
 
-CRITICAL DISTINCTION — two different types of information:
-  METADATA  : year, authors, venue, citation count, reference count, works count, h-index.
-  CONTENT   : findings, numerical results, accuracy, percentages, scores — found in the abstract only.
+CRITICAL DISTINCTION:
+  METADATA  : year, authors, venue, citation count, reference count, h-index.
+              These are bibliographic facts — NEVER treat them as research results.
+  CONTENT   : findings, numerical results, accuracy, percentages, scores, methods,
+              limitations — found in the abstract or full paper text sections.
 
 RULES:
-1. If the user asks about "numeric results", "accuracy", "percentage", "metrics", "performance",
-   "sample size", "score", "outcome", or similar research results:
-   - Look ONLY in the abstract or full paper text for numbers / percentages / scores.
-   - Do NOT use citation count, year, reference count, or works count as research results.
-   - If neither abstract nor full text contains numerical results, say:
-     "The available abstract does not show specific numerical research results.
-      Metadata values available: year=[X], citations=[Y]."
+1. NUMERIC RESULTS — user asks about results, accuracy, percentage, score, metric,
+   performance, sample size, p-value, Sharpe ratio, return, risk, comparison, etc.:
+   - If a "Full paper text" section IS present in the context:
+       Look ONLY in that section for research numbers, percentages, scores, metrics.
+       Do NOT report citation count, year, reference count as research results.
+       If you find numeric research results there, report them. Use (source: full text).
+   - If NO "Full paper text" section is present in the context:
+       Say: "Full text has not been loaded. I cannot report research findings without it."
+       Do NOT use citation count or publication year as a substitute for research results.
 2. A section labeled "Full paper text (intent-matched excerpt ...)" means the full text IS loaded.
    Prefer it for questions about methods, limitations, sample size, findings, and conclusions.
    Use (source: full text) when answering from it.
-3. If the labeled full text section IS present in the context but the specific answer
-   (e.g. limitations, methods) is not visible in that excerpt, say:
-   "The loaded excerpt for this paper does not clearly mention [topic]. The full paper may
-    contain this information outside the shown excerpt."
+3. If the full text IS present but the specific answer is not visible in the excerpt, say:
+   "The loaded excerpt does not clearly show [topic]. The full paper may contain this
+    information outside the extracted sections."
    Do NOT say "full text has not been loaded" when the full text section is present.
-4. If NO full text section is present in the context at all, and the user asks about
-   methods/limitations/findings, say:
+4. If NO full text section is present and user asks about methods/limitations/findings, say:
    "Full text has not been loaded for this paper. I only have the abstract and metadata."
 5. Treat each question independently. Do not carry over intent from previous questions.
 6. If the user asks about authors, venue, year, or citation count, answer from metadata.
@@ -828,12 +877,15 @@ def _build_chat_context(req: ChatRequest) -> tuple[str, list[str]]:
         ref_titles = [str(r.get("title", "")) for r in (pi.get("referenced_works") or [])[:5]]
         if ref_titles:
             lines.append(f"  Refs: {' | '.join(ref_titles)}")
+        citing_titles = [str(r.get("title", "")) for r in (pi.get("citing_works") or [])[:5]]
+        if citing_titles:
+            lines.append(f"  Cited by: {' | '.join(citing_titles)}")
         sources.append("paper_insight")
 
     # Full paper text — intent-matched excerpt so the right section reaches the LLM
     if req.full_text:
         total = len(req.full_text)
-        excerpt = _extract_intent_chunk(req.full_text, req.question, max_chars=3000).strip()
+        excerpt = _extract_intent_chunk(req.full_text, req.question, max_chars=3600).strip()
         lines.append(f"\nFull paper text (intent-matched excerpt, {total:,} chars total):")
         lines.append(excerpt)
         sources.append("full_text")
@@ -869,7 +921,9 @@ _KW_NUMERIC = re.compile(
     r"\bnumeric(al)?\b|\bresult(s)?\b|\bvalue(s)?\b|\baccuracy\b|\bpercentage\b"
     r"|\bpercent\b|\bmetric(s)?\b|\bsample size\b|\bperformance\b|\bscore(s)?\b"
     r"|\bf1\b|\bprecision\b|\brecall\b|\bbenchmark\b|\boutcome(s)?\b|\bfinding(s)?\b"
-    r"|\bmeasurement(s)?\b|\bnumber(s)?\b",
+    r"|\bmeasurement(s)?\b|\bnumber(s)?\b|\bsharpe\b|\bp-value\b|\bAUC\b|\bROC\b"
+    r"|\bRMSE\b|\bMAE\b|\bcomparison\b|\bcompared\b|\bachieved\b|\bincrease\b"
+    r"|\bdecrease\b|\boutperform\b|\bimprove(d|ment)?\b|\brisk\b|\breturn(s)?\b",
     re.IGNORECASE,
 )
 _KW_AUTHOR = re.compile(
@@ -899,42 +953,98 @@ _KW_METHOD = re.compile(
     r"|\bframework\b|\barchitecture\b|\bimplementation\b|\bpipeline\b|\bproposed\b",
     re.IGNORECASE,
 )
-# Numbers that look like research results: percentages, decimals, or 2+ digit integers
-_RE_RESULT_NUM = re.compile(r"\d+\.?\d*\s*%|\d+\.\d+|\b[1-9]\d+\b")
+# Sentence-level filters for the numeric-result extractor.
+# A sentence is a RESEARCH candidate if it matches _RESEARCH_SIGNAL.
+# A sentence is excluded even with a digit if it matches _META_ONLY (pure bibliography).
+_RESEARCH_SIGNAL = re.compile(
+    r"\d+\.?\d*\s*%"                                        # percentages
+    r"|\d+\.\d+"                                            # decimals
+    r"|\bp\s*[<=>]+\s*0\.\d+"                              # p-values
+    r"|\bn\s*=\s*\d+"                                      # sample sizes
+    r"|\b(?:accuracy|precision|recall|F[-_]?1|AUC|RMSE|MAE|MSE|ROC|Sharpe)\b"
+    r"|\bscore\b"                                           # score (context gives it meaning)
+    r"|\bratio\b"
+    r"|\b(?:increase|decrease|improv|outperform|achiev)\w*\s+(?:by|to|from)?\s*\d",
+    re.IGNORECASE,
+)
+_META_ONLY = re.compile(
+    r"\bcit(?:ation|ed)[^.]*\d"      # "cited by 45", "45 citations"
+    r"|\bh[-_]?index\b"
+    r"|\bworks[- ]?count\b"
+    r"|\breference[- ]?count\b"
+    r"|\bDOI\b|\bISSN\b|\bISBN\b"
+    r"|\bpublication[- ]?(?:date|year)\b"
+    r"|\bpage\s+\d+"                 # page numbers
+    r"|\bOrcid\b|\bOpenAlex\b",
+    re.IGNORECASE,
+)
 
 
-def _extract_intent_chunk(full_text: str, question: str, max_chars: int = 3000) -> str:
-    """Return the most relevant section of full_text for the given question.
+def _score_chunk(chunk: str, patterns: list, q_words: set) -> float:
+    """Score a text chunk by regex pattern hits and question-word overlap."""
+    score = sum(len(pat.findall(chunk)) * 2.0 for pat in patterns)
+    cl = chunk.lower()
+    score += sum(0.5 for w in q_words if w in cl)
+    return score
 
-    Detects whether the question asks about limitations, methods, or results, then
-    searches the text for the corresponding section header and extracts surrounding content.
-    Falls back to the beginning of the document when no match is found.
+
+def _extract_intent_chunk(full_text: str, question: str, max_chars: int = 3600) -> str:
+    """Split full_text into ~1200-char chunks, rank by intent keywords, return top-3 in doc order.
+
+    For limitation/method/result questions: scores each chunk by keyword density,
+    then reassembles the top-3 highest-scoring chunks in their original order so
+    the LLM sees coherent, in-context excerpts from the right part of the paper.
     """
     is_limitation = bool(_KW_LIMITATION.search(question))
     is_method = bool(_KW_METHOD.search(question))
     is_result = bool(_KW_NUMERIC.search(question)) and not bool(_KW_CITATION.search(question))
 
     if is_limitation:
-        kw = _KW_LIMITATION
+        primary_pat = _KW_LIMITATION
     elif is_method:
-        kw = _KW_METHOD
+        primary_pat = _KW_METHOD
     elif is_result:
-        # section headers common in empirical papers
-        kw = re.compile(
-            r"\bresult(s)?\b|\bperformance\b|\bexperiment(s)?\b|\bevaluation\b|\baccuracy\b",
+        primary_pat = re.compile(
+            r"\bresult(s)?\b|\bperformance\b|\bexperiment(s)?\b|\bevaluation\b"
+            r"|\baccuracy\b|\bfinding(s)?\b|\b%\b|\btable\b|\bfigure\b"
+            r"|\bmetric(s)?\b|\bscore(s)?\b|\bvalue(s)?\b|\bpercentage\b|\bpercent\b"
+            r"|\bsample\b|\bp-value\b|\bcompar(ed|ison)\b|\bachiev(ed|ement)\b"
+            r"|\bincrease\b|\bdecrease\b|\boutperform\b|\bimprove\b"
+            r"|\bsharpe\b|\bratio\b|\brisk\b|\breturn\b|\bROC\b|\bAUC\b"
+            r"|\bRMSE\b|\bMAE\b|\bF1\b|\bproposed method\b",
             re.IGNORECASE,
         )
     else:
         return full_text[:max_chars]
 
-    match = kw.search(full_text)
-    if match:
-        start = max(0, match.start() - 150)
-        end = min(len(full_text), start + max_chars)
-        return full_text[start:end]
+    # Split on newline boundaries into ~1200-char chunks
+    chunk_size = 1200
+    chunks: list[str] = []
+    start = 0
+    text_len = len(full_text)
+    while start < text_len:
+        end = min(start + chunk_size, text_len)
+        if end < text_len:
+            nl = full_text.rfind("\n", start, end)
+            if nl > start:
+                end = nl + 1
+        chunks.append(full_text[start:end])
+        start = end
 
-    # No matching section found — return beginning
-    return full_text[:max_chars]
+    if not chunks:
+        return full_text[:max_chars]
+
+    q_words = {w.lower() for w in re.findall(r"\w+", question) if len(w) > 3}
+    scored = [
+        (i, _score_chunk(chunk, [primary_pat], q_words))
+        for i, chunk in enumerate(chunks)
+    ]
+    scored.sort(key=lambda x: (-x[1], x[0]))
+
+    # Take top-3 highest-scoring chunks; reassemble in original document order
+    top_indices = sorted(s[0] for s in scored[:3])
+    result = "\n\n[...]\n\n".join(chunks[i] for i in top_indices)
+    return result[:max_chars]
 
 
 def _try_direct_answer(req: ChatRequest) -> str | None:
@@ -953,40 +1063,9 @@ def _try_direct_answer(req: ChatRequest) -> str | None:
     is_limitation = bool(_KW_LIMITATION.search(q))
     is_method = bool(_KW_METHOD.search(q))
 
-    # Numeric / research-result questions (but not "how many citations" which has is_cite too)
-    if is_numeric and not is_cite and not is_author:
-        full_text = req.full_text or ""
-        abstract = pi.get("abstract") or ""
-        # Prefer full text when loaded; fall back to abstract
-        primary = full_text[:10_000] if full_text else abstract
-        source_label = "full text" if full_text else "abstract"
-
-        year = pi.get("publication_year") or sn.get("year")
-        cites = pi.get("cited_by_count") if pi else None
-        if cites is None:
-            cites = sn.get("citations")
-        meta_parts = []
-        if year:
-            meta_parts.append(f"year={year}")
-        if cites is not None:
-            meta_parts.append(f"citations={cites}")
-        meta_str = ", ".join(meta_parts)
-
-        if primary:
-            if not _RE_RESULT_NUM.search(primary):
-                suffix = f" Metadata values available: {meta_str}." if meta_str else ""
-                return (
-                    f"The available {source_label} does not show specific numerical research results."
-                    f"{suffix} (source: paper {source_label})"
-                )
-            return None  # source has numbers — let LLM extract them
-        if pi or sn:
-            suffix = f" Metadata values available: {meta_str}." if meta_str else ""
-            return (
-                "The available metadata/abstract does not show specific numerical results."
-                f"{suffix} (source: paper insight / selected node)"
-            )
-        return None  # no context at all — let LLM reply
+    # Numeric-result questions are handled before _try_direct_answer is called
+    # (see _handle_numeric_result in /chat endpoint). This branch is never reached
+    # for numeric questions without citation/author intent.
 
     # Limitation questions — check whether full text is loaded and whether it contains
     # the limitations section before letting the LLM attempt to extract them.
@@ -1222,6 +1301,101 @@ async def _call_openai(
         return "Received an unexpected response format from OpenAI. Please try again."
 
 
+def _extract_numeric_sentences(full_text: str, max_sentences: int = 15) -> list[str]:
+    """Return sentences from full_text that contain research-numeric signals
+    and are not purely about bibliographic metadata (citations, years, DOI, etc.)."""
+    raw = re.split(r"(?<=[.!?])\s+|\n{2,}", full_text)
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for sent in raw:
+        sent = sent.strip()
+        if len(sent) < 25 or len(sent) > 600:
+            continue
+        if not _RESEARCH_SIGNAL.search(sent):
+            continue
+        if _META_ONLY.search(sent):
+            continue
+        norm = " ".join(sent.split())
+        if norm in seen:
+            continue
+        seen.add(norm)
+        candidates.append(sent)
+        if len(candidates) >= max_sentences:
+            break
+    return candidates
+
+
+async def _handle_numeric_result(req: ChatRequest, provider: str, credential: str) -> dict:
+    """Dedicated handler for numeric-result questions.
+
+    Extracts research-numeric sentences from full text before the LLM is called,
+    so metadata values (citation count, year, references) can never leak in as results.
+    """
+    if not req.full_text:
+        pi = req.paper_insight or {}
+        sn = req.selected_node or {}
+        year = pi.get("publication_year") or sn.get("year")
+        cites = pi.get("cited_by_count") if pi else sn.get("citations")
+        meta_parts = []
+        if year:
+            meta_parts.append(f"year={year}")
+        if cites is not None:
+            meta_parts.append(f"citations={cites}")
+        meta_note = f" (available metadata: {', '.join(meta_parts)})" if meta_parts else ""
+        return {
+            "answer": (
+                "Full text has not been loaded for this paper. "
+                "I cannot report research findings without it. "
+                f"Click 'Load Full Text' if available.{meta_note} (source: metadata only)"
+            ),
+            "sources_used": [],
+        }
+
+    candidates = _extract_numeric_sentences(req.full_text, max_sentences=15)
+
+    if not candidates:
+        return {
+            "answer": (
+                "The loaded full text does not clearly show specific numerical research results. "
+                "Results may be in tables, figures, or appendices not captured in the extracted text. "
+                "(source: full text)"
+            ),
+            "sources_used": ["full_text"],
+        }
+
+    # Send ONLY the candidate sentences to the LLM — no metadata can leak in
+    candidate_block = "\n".join(f"• {s}" for s in candidates)
+    focused_context = (
+        "CANDIDATE RESULT SENTENCES extracted from the full paper text:\n\n"
+        f"{candidate_block}"
+    )
+    focused_question = (
+        f"{req.question}\n\n"
+        "Based ONLY on the candidate sentences above, summarize the numerical research "
+        "results. Do NOT use citation count, year, reference count, or any publication "
+        "metadata. End your answer with (source: full text)."
+    )
+
+    try:
+        if provider == "ollama":
+            answer = await _call_ollama(credential, focused_context, focused_question, [])
+        elif provider == "gemini":
+            answer = await _call_gemini(credential, focused_context, focused_question, [])
+        else:
+            answer = await _call_openai(credential, focused_context, focused_question, [])
+    except Exception as exc:
+        print(f"AIRA numeric handler error ({provider}): {type(exc).__name__}")
+        return {
+            "answer": (
+                f"Could not reach the {provider.capitalize()} service. "
+                "Check your connection and try again."
+            ),
+            "sources_used": [],
+        }
+
+    return {"answer": answer, "sources_used": ["full_text"]}
+
+
 @app.get("/chat/status")
 def chat_status():
     """Return provider configuration status for AIRA Assistant (no secrets exposed)."""
@@ -1260,6 +1434,17 @@ async def chat(req: ChatRequest):
             ),
             "sources_used": [],
         }
+
+    # Numeric-result questions: extract candidate sentences from full text BEFORE
+    # the LLM sees any context, so metadata (citations, year, references) can never
+    # be confused with research findings.
+    q = req.question
+    if (
+        bool(_KW_NUMERIC.search(q))
+        and not bool(_KW_CITATION.search(q))
+        and not bool(_KW_AUTHOR.search(q))
+    ):
+        return await _handle_numeric_result(req, provider, credential)
 
     context, sources_used = _build_chat_context(req)
 
