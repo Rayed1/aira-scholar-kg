@@ -20,6 +20,9 @@ The system can:
 * Filter the graph by node type
 * Show graph summary statistics
 * Export the graph as PNG or JSON
+* Load full text for open-access papers and answer questions grounded in it
+* Chat with AIRA Assistant using a local Ollama model (no API key required)
+* Add papers to a Review List and export as Markdown or CSV
 
 ---
 
@@ -197,6 +200,8 @@ If no matching University of Oulu-related publications are found, the app shows 
 * Metadata quality depends on OpenAlex coverage.
 * Citation expansion is limited to keep the graph readable.
 * The prototype is not yet integrated with the full AIRA Scholar agentic workflow.
+* Full text is only loaded from open-access PDF links. The system does not bypass paywalls.
+* Ollama must be running locally for the AIRA Assistant to work without an API key. Run `ollama pull llama3.2` to set up the default model.
 
 ---
 

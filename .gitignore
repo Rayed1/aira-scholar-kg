@@ -33,6 +33,9 @@ backend/.venv/
 backend/__pycache__/
 backend/**/*.pyc
 
+# Local SQLite cache (phase 2 persistence layer)
+backend/data/
+
 # Environment files
 .env
 backend/.env
