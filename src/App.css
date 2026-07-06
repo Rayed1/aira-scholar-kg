@@ -1032,19 +1032,65 @@ body {
 
 /* ── AIRA Assistant chat ─────────────────────────────────────── */
 
-.aira-chat {
-  margin-top: 20px;
-  border-top: 1px solid #1e1e23;
-  padding-top: 14px;
+/* ── AIRA Assistant floating widget ─────────────────────────── */
+
+.chat-fab {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  z-index: 500;
+  background: #1e1e28;
+  border: 1.5px solid #4f46e5;
+  border-radius: 10px;
+  color: #c4c4f0;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  padding: 10px 22px;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s, background 0.15s, box-shadow 0.15s;
+  font-family: inherit;
+  box-shadow: 0 2px 14px rgba(79, 70, 229, 0.28);
 }
 
-.chat-header {
+.chat-fab:hover {
+  border-color: #6d67f5;
+  color: #fff;
+  background: #26263e;
+  box-shadow: 0 4px 24px rgba(79, 70, 229, 0.48);
+}
+
+.chat-fab-open {
+  border-color: #3f3f46;
+  color: #71717a;
+  box-shadow: none;
+  background: #18181b;
+}
+
+.chat-popup {
+  position: fixed;
+  bottom: 68px;
+  right: 24px;
+  z-index: 500;
+  width: 400px;
+  max-height: 540px;
+  display: flex;
+  flex-direction: column;
+  background: #0d0d10;
+  border: 1px solid #27272a;
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: 0 8px 40px rgba(0, 0, 0, 0.7);
+}
+
+.chat-popup-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  cursor: pointer;
-  margin-bottom: 10px;
-  user-select: none;
+  padding: 11px 14px 10px;
+  border-bottom: 1px solid #1e1e23;
+  flex-shrink: 0;
 }
 
 .chat-header-title {
@@ -1060,7 +1106,7 @@ body {
   border: none;
   color: #52525b;
   cursor: pointer;
-  font-size: 11px;
+  font-size: 14px;
   padding: 0;
   line-height: 1;
 }
@@ -1069,11 +1115,35 @@ body {
   color: #a1a1aa;
 }
 
+.chat-popup-suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding: 10px 14px 8px;
+  flex-shrink: 0;
+  border-bottom: 1px solid #1e1e23;
+}
+
 .chat-suggestions {
   display: flex;
   flex-wrap: wrap;
   gap: 5px;
   margin-bottom: 10px;
+}
+
+.chat-popup-messages {
+  flex: 1;
+  min-height: 0;
+  max-height: 280px;
+  padding: 10px 14px;
+}
+
+.chat-popup-input-row {
+  display: flex;
+  gap: 6px;
+  padding: 8px 14px 12px;
+  border-top: 1px solid #1e1e23;
+  flex-shrink: 0;
 }
 
 .chat-suggestion-btn {
@@ -1439,4 +1509,211 @@ body {
   background: #022c22;
   cursor: default;
   opacity: 1;
+}
+
+.custom-graph-tooltip {
+  position: fixed;
+  max-width: 320px;
+  padding: 5px 9px;
+  border-radius: 4px;
+  font: 12px/1.5 Inter, sans-serif;
+  color: #eee;
+  background: rgba(0, 0, 0, 0.75);
+  pointer-events: none;
+  white-space: normal;
+  word-break: break-word;
+  z-index: 9999;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+}
+
+/* ── Paper insight enrichment additions ──────────────────────── */
+
+.pi-citation-note {
+  font-size: 10px;
+  color: #52525b;
+  margin: 0;
+  line-height: 1.4;
+}
+
+.pi-provenance {
+  font-size: 10px;
+  color: #3f3f46;
+  margin: 0;
+  line-height: 1.4;
+}
+
+.pi-meta-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.pi-meta-line {
+  font-size: 11px;
+  color: #71717a;
+  line-height: 1.5;
+}
+
+.pi-meta-line .ai-work-link {
+  font-size: 11px;
+}
+
+/* ── Semantic search ─────────────────────────────────────────── */
+
+.semantic-results-view {
+  height: 100%;
+  background: #09090b;
+  overflow-y: auto;
+  padding: 20px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.semantic-results-view::-webkit-scrollbar { width: 4px; }
+.semantic-results-view::-webkit-scrollbar-thumb { background: #27272a; border-radius: 999px; }
+.semantic-results-view::-webkit-scrollbar-track { background: transparent; }
+
+.semantic-results-caption {
+  font-size: 11px;
+  color: #52525b;
+  line-height: 1.5;
+  margin: 0 0 16px;
+}
+
+.semantic-status {
+  font-size: 12px;
+  color: #52525b;
+  text-align: center;
+  padding: 48px 0;
+  margin: 0;
+}
+
+.semantic-status-error {
+  color: #ef4444;
+}
+
+.semantic-result-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.semantic-result-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 10px 12px;
+  background: #111113;
+  border: 1px solid #1e1e23;
+  border-radius: 7px;
+  cursor: default;
+}
+
+.semantic-result-clickable {
+  cursor: pointer;
+}
+
+.semantic-result-clickable:hover {
+  background: #18181b;
+  border-color: #2e2e34;
+}
+
+.semantic-result-rank {
+  font-size: 11px;
+  color: #3f3f46;
+  min-width: 18px;
+  padding-top: 2px;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+.semantic-result-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.semantic-result-title {
+  font-size: 13px;
+  color: #e4e4e7;
+  line-height: 1.4;
+  font-weight: 500;
+}
+
+.semantic-result-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.semantic-result-year {
+  font-size: 11px;
+  color: #71717a;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+.semantic-result-authors {
+  font-size: 11px;
+  color: #52525b;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 340px;
+}
+
+.semantic-result-venue {
+  font-size: 10px;
+  color: #3f3f46;
+  font-style: italic;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 260px;
+}
+
+.semantic-result-aside {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.semantic-result-score {
+  font-size: 11px;
+  color: #71717a;
+  font-variant-numeric: tabular-nums;
+}
+
+.semantic-result-oa {
+  font-size: 9px;
+  font-weight: 600;
+  color: #10b981;
+  letter-spacing: 0.05em;
+  border: 1px solid rgba(16, 185, 129, 0.25);
+  border-radius: 3px;
+  padding: 1px 4px;
+}
+
+.semantic-result-detail {
+  font-size: 10px;
+  color: #5b6cff;
+}
+
+.semantic-cap-notice {
+  font-size: 11px;
+  color: #71717a;
+  margin: 0 0 12px;
+  padding: 6px 10px;
+  background: #18181b;
+  border: 1px solid #27272a;
+  border-radius: 5px;
 }

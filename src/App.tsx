@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import ForceGraph2D, { type ForceGraphMethods } from "react-force-graph-2d";
 import ForceGraph3D from "react-force-graph-3d";
+import { forceCollide } from "d3-force";
 import "./App.css";
 
 // ── Graph types ─────────────────────────────────────────────────────────────
@@ -28,6 +29,10 @@ type EdgeInfo = {
 type GraphResponse = {
   nodes: NodeInfo[];
   edges: EdgeInfo[];
+  requested_limit: number;
+  actual_count: number;
+  limit_reason: "exact_match" | "no_more_results" | "safety_cap_reached";
+  pages_fetched: number;
 };
 
 type GraphSummary = {
@@ -137,7 +142,17 @@ type FullTextResult = {
   source_url: string | null;
   text: string;
   text_length: number;
-  status: "ok" | "no_pdf" | "download_error" | "extraction_error" | "missing_dependency" | "error";
+  candidates_tried?: number;
+  // Legacy statuses kept for any cached responses from before the fallback chain.
+  status:
+    | "ok"
+    | "no_readable_source"
+    | "unreadable_pdf"
+    | "no_pdf"
+    | "download_error"
+    | "extraction_error"
+    | "missing_dependency"
+    | "error";
 };
 
 type PaperInsight = {
@@ -162,6 +177,35 @@ type PaperInsight = {
   referenced_works_count: number;
   referenced_works: PaperInsightRef[];
   citing_works: PaperInsightRef[];
+  // Crossref enrichment fields
+  crossref_verified?: boolean;
+  publisher?: string | null;
+  issn?: string | null;
+  license_url?: string | null;
+  funder?: { name: string; award: string[] }[] | null;
+  crossref_citation_count?: number | null;
+  // Semantic Scholar enrichment fields
+  semantic_scholar_paper_id?: string | null;
+  semantic_scholar_citation_count?: number | null;
+  semantic_scholar_related?: { title: string; year: number | null; doi: string | null; paper_id: string | null }[] | null;
+  // Multi-source citation cross-check
+  citation_count_diverges?: boolean;
+  citation_count_diverging_sources?: string[];
+  citation_count_sources?: Record<string, number>;
+  // arXiv preprint linkage
+  has_preprint?: boolean;
+  preprint_match_confidence?: "openalex_linked" | "doi_match" | "title_fuzzy_match" | "none";
+  arxiv_id?: string | null;
+  arxiv_url?: string | null;
+  arxiv_pdf_url?: string | null;
+  arxiv_published_date?: string | null;
+  arxiv_updated_date?: string | null;
+  // OpenAIRE enrichment fields
+  openaire_id?: string | null;
+  funding_projects?: { name: string | null; acronym: string | null; funder: string | null; funder_id: string | null; start_date: string | null; end_date: string | null; url: string | null }[] | null;
+  linked_datasets?: { title: string | null; url: string | null; doi: string | null }[] | null;
+  linked_software?: { title: string | null; url: string | null }[] | null;
+  provenance?: Record<string, string>;
 };
 
 // ── Chat types ──────────────────────────────────────────────────────────────
@@ -169,6 +213,20 @@ type PaperInsight = {
 type ChatMessage = {
   role: "user" | "assistant" | "system";
   content: string;
+};
+
+// ── Semantic search types ────────────────────────────────────────────────────
+
+type SemanticResult = {
+  id: string;
+  openalex_id: string;
+  title: string | null;
+  authors: string[];
+  year: number | null;
+  venue: string | null;
+  score: number;
+  is_oa: boolean;
+  local_paper_available: boolean;
 };
 
 // ── Graph helpers ───────────────────────────────────────────────────────────
@@ -181,11 +239,12 @@ const getNodeColor = (type: NodeInfo["type"]) => {
   return "#ffffff";
 };
 
-const getNodeSize = (type: NodeInfo["type"]) => {
-  if (type === "Paper") return 6;
-  if (type === "ReferencedPaper") return 4.8;
-  if (type === "Topic") return 5.2;
-  return 5.2;
+const getNodeRadius = (node: GraphNode): number => {
+  // Base sizes match the old getNodeSize*2.8 scale so uncited nodes remain clearly visible.
+  // Citation count adds a log-scaled bonus so highly-cited papers stand out proportionally.
+  if (node.type === "Paper") return 14 + Math.log1p(node.citations ?? 0) * 1.5;
+  if (node.type === "ReferencedPaper") return 9 + Math.log1p(node.citations ?? 0) * 1.2;
+  return 10; // Author / Topic: uniform
 };
 
 const getShortLabel = (label: string) => {
@@ -196,6 +255,7 @@ const getLinkNodeId = (node: string | GraphNode) => {
   return typeof node === "object" ? node.id : String(node);
 };
 
+
 // ── App ─────────────────────────────────────────────────────────────────────
 
 function App() {
@@ -203,10 +263,11 @@ function App() {
   const authorFetchGen = useRef(0);
   const paperFetchGen = useRef(0);
   const chatEndRef = useRef<HTMLDivElement | null>(null);
+  const hoverNodeIdRef = useRef<string | null>(null);
+  const tooltipDivRef = useRef<HTMLDivElement | null>(null);
 
   // ── Graph state ────────────────────────────────────────────
   const [selectedNode, setSelectedNode] = useState<NodeInfo | null>(null);
-  const [hoverNodeId, setHoverNodeId] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState("artificial intelligence");
   const [isLoading, setIsLoading] = useState(false);
   const [fromYear, setFromYear] = useState("2020");
@@ -219,6 +280,7 @@ function App() {
   );
   const [nodeSearchTerm, setNodeSearchTerm] = useState("");
   const [isFocusMode, setIsFocusMode] = useState(false);
+  const [showIsolated, setShowIsolated] = useState(false);
 
   const [graphData, setGraphData] = useState<ForceGraphData>({
     nodes: [],
@@ -252,11 +314,18 @@ function App() {
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
-  const [isChatCollapsed, setIsChatCollapsed] = useState(false);
+  const [isChatCollapsed, setIsChatCollapsed] = useState(true);
 
   // ── Review List state ──────────────────────────────────
   const [reviewList, setReviewList] = useState<PaperInsight[]>([]);
   const [reviewListOpen, setReviewListOpen] = useState(false);
+
+  // ── Semantic search state ──────────────────────────────
+  const [searchMode, setSearchMode] = useState<"keyword" | "semantic">("keyword");
+  const [semanticResults, setSemanticResults] = useState<SemanticResult[]>([]);
+  const [semanticLoading, setSemanticLoading] = useState(false);
+  const [semanticError, setSemanticError] = useState<string | null>(null);
+  const [semanticCapInfo, setSemanticCapInfo] = useState<{ requested: number; actual: number } | null>(null);
 
   // ── Derived graph data ─────────────────────────────────────
 
@@ -277,13 +346,83 @@ function App() {
     return { nodes: visibleNodes, links: visibleLinks };
   }, [activeFilter, graphData]);
 
+  // BFS to find the largest connected component; only meaningful for the full graph view
+  const isolatedNodeIds = useMemo((): Set<string> => {
+    if (activeFilter !== "All") return new Set();
+    const { nodes, links } = visibleGraphData;
+    if (nodes.length < 2) return new Set();
+
+    const adj = new Map<string, string[]>();
+    nodes.forEach((n) => adj.set(n.id, []));
+    links.forEach((l) => {
+      const s = getLinkNodeId(l.source);
+      const t = getLinkNodeId(l.target);
+      adj.get(s)?.push(t);
+      adj.get(t)?.push(s);
+    });
+
+    const visited = new Set<string>();
+    let largest = new Set<string>();
+    for (const node of nodes) {
+      if (visited.has(node.id)) continue;
+      const component = new Set<string>();
+      const queue: string[] = [node.id];
+      while (queue.length > 0) {
+        const curr = queue.shift()!;
+        if (visited.has(curr)) continue;
+        visited.add(curr);
+        component.add(curr);
+        for (const nb of (adj.get(curr) ?? [])) {
+          if (!visited.has(nb)) queue.push(nb);
+        }
+      }
+      if (component.size > largest.size) largest = component;
+    }
+
+    const isolated = new Set<string>();
+    nodes.forEach((n) => { if (!largest.has(n.id)) isolated.add(n.id); });
+    return isolated;
+  }, [visibleGraphData, activeFilter]);
+
+  // Isolation-filtered data: no dependency on highlightNodes/highlightLinks so its reference
+  // stays stable when the user clicks nodes. A stable reference prevents the library from
+  // internally calling .alpha(1) (full reheat) on every click event.
+  const stableGraphData = useMemo((): ForceGraphData => {
+    if (!showIsolated && isolatedNodeIds.size > 0) {
+      const mainIds = new Set(
+        visibleGraphData.nodes.map((n) => n.id).filter((id) => !isolatedNodeIds.has(id))
+      );
+      return {
+        nodes: visibleGraphData.nodes.filter((n) => !isolatedNodeIds.has(n.id)),
+        links: visibleGraphData.links.filter((l) => {
+          const s = getLinkNodeId(l.source);
+          const t = getLinkNodeId(l.target);
+          return mainIds.has(s) && mainIds.has(t);
+        }),
+      };
+    }
+    return visibleGraphData;
+  }, [visibleGraphData, showIsolated, isolatedNodeIds]);
+
+  // In normal mode returns stableGraphData directly (same reference → no library reheat on
+  // highlight changes). Only in focus mode is a new filtered object created.
   const displayGraphData = useMemo((): ForceGraphData => {
-    if (!isFocusMode || highlightNodes.size === 0) return visibleGraphData;
-    return {
-      nodes: visibleGraphData.nodes.filter((n) => highlightNodes.has(n.id)),
-      links: visibleGraphData.links.filter((l) => highlightLinks.has(l.id)),
-    };
-  }, [isFocusMode, visibleGraphData, highlightNodes, highlightLinks]);
+    if (isFocusMode && highlightNodes.size > 0) {
+      return {
+        nodes: stableGraphData.nodes.filter((n) => highlightNodes.has(n.id)),
+        links: stableGraphData.links.filter((l) => highlightLinks.has(l.id)),
+      };
+    }
+    return stableGraphData;
+  }, [isFocusMode, stableGraphData, highlightNodes, highlightLinks]);
+
+  // Strictly top-5 most-cited nodes get permanent labels — hard cap so labels never crowd.
+  const topCitedIds = useMemo((): Set<string> => {
+    const sorted = [...displayGraphData.nodes]
+      .filter((n) => n.type === "Paper" || n.type === "ReferencedPaper")
+      .sort((a, b) => (b.citations ?? 0) - (a.citations ?? 0));
+    return new Set(sorted.slice(0, 5).map((n) => n.id));
+  }, [displayGraphData]);
 
   const nodeSearchMatchCount = useMemo(() => {
     const q = nodeSearchTerm.trim().toLowerCase();
@@ -298,7 +437,8 @@ function App() {
   const loadGraph = async (query: string) => {
     setIsLoading(true);
     setSelectedNode(null);
-    setHoverNodeId(null);
+    hoverNodeIdRef.current = null;
+    if (tooltipDivRef.current) tooltipDivRef.current.style.display = "none";
     setActiveFilter("All");
     setHighlightNodes(new Set());
     setHighlightLinks(new Set());
@@ -337,8 +477,17 @@ function App() {
         citedPapers: backendGraph.nodes.filter((n) => n.type === "ReferencedPaper").length,
         edges: backendGraph.edges.length,
       });
+      const paperCount = backendGraph.actual_count;
+      const requested = backendGraph.requested_limit;
+      const reason = backendGraph.limit_reason;
+      const paperSummary =
+        paperCount < requested
+          ? `${paperCount} of ${requested} requested papers loaded (${
+              reason === "no_more_results" ? "no more results" : "safety cap reached"
+            })`
+          : `${paperCount} papers loaded`;
       setStatusMessage(
-        `Loaded ${backendGraph.nodes.length} nodes and ${backendGraph.edges.length} edges`
+        `${paperSummary} · ${backendGraph.nodes.length} nodes, ${backendGraph.edges.length} edges`
       );
     } catch (error) {
       console.error(error);
@@ -354,7 +503,8 @@ function App() {
 
   const filterGraph = (type: FilterType) => {
     setSelectedNode(null);
-    setHoverNodeId(null);
+    hoverNodeIdRef.current = null;
+    if (tooltipDivRef.current) tooltipDivRef.current.style.display = "none";
     setActiveFilter(type);
     setHighlightNodes(new Set());
     setHighlightLinks(new Set());
@@ -434,6 +584,52 @@ function App() {
     setFullTextStatus(null);
   };
 
+  const loadSemanticSearch = () => {
+    if (!searchTerm.trim()) return;
+    setSemanticLoading(true);
+    setSemanticError(null);
+    setSemanticResults([]);
+    setSemanticCapInfo(null);
+    const requested = Math.max(parseInt(resultLimit) || 10, 1);
+    fetch(`http://127.0.0.1:8000/search/semantic?q=${encodeURIComponent(searchTerm)}&limit=${requested}`)
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json() as Promise<{
+          query: string;
+          requested_limit: number;
+          actual_count: number;
+          limit_reason: string;
+          results: SemanticResult[];
+        }>;
+      })
+      .then((data) => {
+        setSemanticResults(data.results);
+        if (data.limit_reason === "capped_at_max" && data.requested_limit > data.actual_count) {
+          setSemanticCapInfo({ requested: data.requested_limit, actual: data.actual_count });
+        }
+        setSemanticLoading(false);
+      })
+      .catch((err: unknown) => {
+        setSemanticError(err instanceof Error ? err.message : "Semantic search failed.");
+        setSemanticLoading(false);
+      });
+  };
+
+  const handleSemanticResultClick = (result: SemanticResult) => {
+    setSelectedNode({
+      id: result.id,
+      label: result.title || result.id,
+      type: "Paper",
+      details: "",
+      year: result.year ?? undefined,
+      venue: result.venue ?? undefined,
+    });
+    setHighlightNodes(new Set([result.id]));
+    setHighlightLinks(new Set());
+    fetchPaperInsight(result.id);
+    clearAuthorInsight();
+  };
+
   const loadFullText = (workId: string) => {
     setFullTextLoading(true);
     setFullTextStatus(null);
@@ -503,7 +699,8 @@ function App() {
 
   const resetHighlight = () => {
     setSelectedNode(null);
-    setHoverNodeId(null);
+    hoverNodeIdRef.current = null;
+    if (tooltipDivRef.current) tooltipDivRef.current.style.display = "none";
     setHighlightNodes(new Set());
     setHighlightLinks(new Set());
     setIsFocusMode(false);
@@ -706,7 +903,14 @@ function App() {
         setChatMessages((prev) => [...prev, { role: "assistant", content: errMsg }]);
         return;
       }
-      const data = (await res.json()) as { answer: string; sources_used: string[] };
+      const data = (await res.json()) as { answer: string; sources_used: string[] } | null;
+      if (!data?.answer) {
+        setChatMessages((prev) => [
+          ...prev,
+          { role: "assistant", content: "Received an empty response from the server. Please try again." },
+        ]);
+        return;
+      }
       setChatMessages((prev) => [...prev, { role: "assistant", content: data.answer }]);
     } catch (err) {
       console.error("Chat error:", err);
@@ -728,11 +932,19 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Re-apply forces when the displayed data or view mode changes
+  // Re-apply forces only when the actual node set changes, not on highlight/selection changes.
+  // Using stableGraphData (not displayGraphData) prevents reheat on every node click.
   useEffect(() => {
     if (graphView !== "2D") return;
     const fg = graphRef.current;
-    if (!fg || displayGraphData.nodes.length === 0) return;
+    if (!fg || stableGraphData.nodes.length === 0) return;
+
+    const nodeCount = stableGraphData.nodes.length;
+    // Conservative scaling: start from the original -45/55 values and increase only
+    // moderately for large graphs. Avoids the stretched-tendril effect of strong repulsion.
+    const extra = Math.max(0, nodeCount - 80);
+    const chargeStrength = Math.max(-90, -45 - extra * 0.14);
+    const linkDist = Math.min(72, 55 + extra * 0.065);
 
     const linkForce = fg.d3Force("link") as
       | { distance?: (v: number) => void; strength?: (v: number) => void }
@@ -741,12 +953,22 @@ function App() {
       | { strength?: (v: number) => void }
       | undefined;
 
-    linkForce?.distance?.(55);
+    linkForce?.distance?.(linkDist);
     linkForce?.strength?.(0.16);
-    chargeForce?.strength?.(-45);
+    chargeForce?.strength?.(chargeStrength);
+
+    // Collision force prevents hard overlaps; 0.75× radius keeps clusters tight.
+    fg.d3Force(
+      "collide",
+      forceCollide()
+        .radius((n) => getNodeRadius(n as GraphNode) * 0.75)
+        .strength(0.6)
+        .iterations(2)
+    );
+
     fg.d3ReheatSimulation();
     window.setTimeout(() => fg.zoomToFit(700, 10), 900);
-  }, [displayGraphData, graphView]);
+  }, [stableGraphData, graphView]);
 
   // Scroll chat to bottom whenever messages change
   useEffect(() => {
@@ -827,6 +1049,16 @@ function App() {
             <button className={`filter-btn${activeFilter === "Topic" ? " active" : ""}`} onClick={() => filterGraph("Topic")}>Topics Only</button>
             <button className={`filter-btn${activeFilter === "ReferencedPaper" ? " active" : ""}`} onClick={() => filterGraph("ReferencedPaper")}>Cited Papers</button>
           </div>
+          {isolatedNodeIds.size > 0 && (
+            <div className="filter-list" style={{ marginTop: 6 }}>
+              <button
+                className={`filter-btn${showIsolated ? " active" : ""}`}
+                onClick={() => setShowIsolated((v) => !v)}
+              >
+                {showIsolated ? "Hide" : "Show"} isolated ({isolatedNodeIds.size})
+              </button>
+            </div>
+          )}
         </div>
 
         <div className="sidebar-section">
@@ -898,26 +1130,112 @@ function App() {
               className="search-input"
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") void loadGraph(searchTerm); }}
-              placeholder="Search publications by topic..."
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  if (searchMode === "semantic") loadSemanticSearch();
+                  else void loadGraph(searchTerm);
+                }
+              }}
+              placeholder={searchMode === "semantic" ? "Search by topic or concept…" : "Search publications by topic..."}
             />
-            <input className="year-input" value={fromYear} onChange={(e) => setFromYear(e.target.value)} placeholder="From" />
-            <span className="year-sep">–</span>
-            <input className="year-input" value={toYear} onChange={(e) => setToYear(e.target.value)} placeholder="To" />
+            {searchMode === "keyword" && (
+              <>
+                <input className="year-input" value={fromYear} onChange={(e) => setFromYear(e.target.value)} placeholder="From" />
+                <span className="year-sep">–</span>
+                <input className="year-input" value={toYear} onChange={(e) => setToYear(e.target.value)} placeholder="To" />
+              </>
+            )}
             <input className="limit-input" value={resultLimit} onChange={(e) => setResultLimit(e.target.value)} placeholder="Limit" />
-            <button className="search-btn" onClick={() => void loadGraph(searchTerm)} disabled={isLoading}>
-              {isLoading ? "Loading…" : "Search"}
+            <button
+              className="search-btn"
+              onClick={() => { if (searchMode === "semantic") loadSemanticSearch(); else void loadGraph(searchTerm); }}
+              disabled={isLoading || semanticLoading}
+            >
+              {isLoading || semanticLoading ? "Loading…" : "Search"}
             </button>
             <div className="view-toggle">
-              <button className={`toggle-btn${graphView === "2D" ? " active" : ""}`} onClick={() => setGraphView("2D")}>2D</button>
-              <button className={`toggle-btn${graphView === "3D" ? " active" : ""}`} onClick={() => setGraphView("3D")}>3D</button>
+              <button className={`toggle-btn${searchMode === "keyword" ? " active" : ""}`} onClick={() => setSearchMode("keyword")}>Keyword</button>
+              <button className={`toggle-btn${searchMode === "semantic" ? " active" : ""}`} onClick={() => setSearchMode("semantic")}>Semantic</button>
             </div>
+            {searchMode === "keyword" && (
+              <div className="view-toggle">
+                <button className={`toggle-btn${graphView === "2D" ? " active" : ""}`} onClick={() => setGraphView("2D")}>2D</button>
+                <button className={`toggle-btn${graphView === "3D" ? " active" : ""}`} onClick={() => setGraphView("3D")}>3D</button>
+              </div>
+            )}
           </div>
         </header>
 
         <div className="workspace">
+          {/* ── Semantic results view ── */}
+          {searchMode === "semantic" && (
+            <div className="semantic-results-view">
+              <p className="semantic-results-caption">
+                Results are ranked by conceptual similarity, not exact keyword match.
+                Searches across the full Oulucris publications collection ({"≈"}50,000 papers).
+                Click any result to open its paper detail panel.
+              </p>
+              {semanticCapInfo && (
+                <p className="semantic-cap-notice">
+                  Showing {semanticCapInfo.actual} of {semanticCapInfo.requested} requested — limit is 200 per search.
+                </p>
+              )}
+              {semanticLoading && <p className="semantic-status">Searching…</p>}
+              {semanticError && <p className="semantic-status semantic-status-error">{semanticError}</p>}
+              {!semanticLoading && !semanticError && semanticResults.length === 0 && (
+                <p className="semantic-status">Enter a search term and press Search to find related papers.</p>
+              )}
+              {semanticResults.length > 0 && (
+                <ol className="semantic-result-list">
+                  {semanticResults.map((result, i) => (
+                    <li
+                      key={result.id || i}
+                      className="semantic-result-item semantic-result-clickable"
+                      onClick={() => handleSemanticResultClick(result)}
+                    >
+                      <div className="semantic-result-rank">{i + 1}</div>
+                      <div className="semantic-result-body">
+                        <div className="semantic-result-title">{result.title || result.id}</div>
+                        <div className="semantic-result-meta">
+                          {result.year && <span className="semantic-result-year">{result.year}</span>}
+                          {result.authors.length > 0 && (
+                            <span className="semantic-result-authors">{result.authors.join(", ")}</span>
+                          )}
+                          {result.venue && <span className="semantic-result-venue">{result.venue}</span>}
+                        </div>
+                      </div>
+                      <div className="semantic-result-aside">
+                        <span className="semantic-result-score">{(result.score * 100).toFixed(1)}%</span>
+                        {result.is_oa && <span className="semantic-result-oa">OA</span>}
+                        <span className="semantic-result-detail">↗</span>
+                      </div>
+                    </li>
+                  ))}
+                </ol>
+              )}
+            </div>
+          )}
+
           {/* ── Graph canvas ── */}
-          <div className="graph-view">
+          {searchMode === "keyword" && <div
+            className="graph-view"
+            onMouseMove={(e) => {
+              const div = tooltipDivRef.current;
+              if (!div || div.style.display === "none") return;
+              const OFFSET = 14;
+              const vw = window.innerWidth;
+              const vh = window.innerHeight;
+              const tw = div.offsetWidth;
+              const th = div.offsetHeight;
+              let left = e.clientX + OFFSET;
+              let top = e.clientY + OFFSET;
+              if (left + tw > vw - 8) left = e.clientX - tw - OFFSET;
+              if (top + th > vh - 8) top = e.clientY - th - OFFSET;
+              div.style.left = `${left}px`;
+              div.style.top = `${top}px`;
+            }}
+          >
+            <div ref={tooltipDivRef} className="custom-graph-tooltip" style={{ display: "none", left: 0, top: 0 }} />
             <div className="graph-overlay-tl">
               <span>
                 {isFocusMode
@@ -967,8 +1285,11 @@ function App() {
                 ref={graphRef}
                 graphData={displayGraphData}
                 nodeId="id"
-                nodeLabel={(node) => (node as GraphNode).label}
-                nodeVal={(node) => getNodeSize((node as GraphNode).type)}
+                nodeLabel=""
+                nodeVal={(node) => {
+                  const r = getNodeRadius(node as GraphNode);
+                  return (r * r) / 25; // area-proportional layout weight
+                }}
                 nodeColor={(node) => {
                   const gn = node as GraphNode;
                   if (highlightNodes.size === 0) return getNodeColor(gn.type);
@@ -994,16 +1315,28 @@ function App() {
                 cooldownTicks={260}
                 onEngineStop={() => graphRef.current?.zoomToFit(600, 10)}
                 onNodeClick={(node) => handleNodeClick(node as GraphNode)}
-                onNodeHover={(node) => setHoverNodeId(node ? (node as GraphNode).id : null)}
+                onNodeHover={(node) => {
+                  const id = node ? (node as GraphNode).id : null;
+                  hoverNodeIdRef.current = id;
+                  const div = tooltipDivRef.current;
+                  if (div) {
+                    if (node) {
+                      div.textContent = (node as GraphNode).label;
+                      div.style.display = "block";
+                    } else {
+                      div.style.display = "none";
+                    }
+                  }
+                }}
                 onBackgroundClick={resetHighlight}
                 nodeCanvasObject={(node, ctx, globalScale) => {
                   const gn = node as GraphNode;
                   const x = gn.x ?? 0;
                   const y = gn.y ?? 0;
                   const isSelected = selectedNode?.id === gn.id;
-                  const isHovered = hoverNodeId === gn.id;
+                  const isHovered = hoverNodeIdRef.current === gn.id;
                   const isFaded = highlightNodes.size > 0 && !highlightNodes.has(gn.id);
-                  const nodeSize = getNodeSize(gn.type) * 2.8;
+                  const nodeSize = getNodeRadius(gn);
 
                   ctx.save();
                   ctx.globalAlpha = isFaded ? 0.18 : 1;
@@ -1015,24 +1348,31 @@ function App() {
                   ctx.fill();
                   ctx.stroke();
 
-                  if ((isSelected || isHovered) && !isFaded) {
+                  // Labels: only on hover/select, OR for the strict top-5 permanent labels.
+                  // Suppress the permanent canvas label while hovering — the custom tooltip
+                  // already shows the full title, so showing both would be redundant.
+                  const isPermanent = topCitedIds.has(gn.id);
+                  const showLabel = !isFaded && (isSelected || (isHovered && !isPermanent) || (isPermanent && !isHovered));
+                  if (showLabel) {
                     const label = getShortLabel(gn.label);
-                    const fontSize = Math.max(10, 14 / globalScale);
-                    ctx.font = `600 ${fontSize}px Sans-Serif`;
+                    const fontSize = Math.max(9, 13 / globalScale);
+                    const bold = isSelected || isHovered || isPermanent;
+                    ctx.font = `${bold ? "600" : "400"} ${fontSize}px Sans-Serif`;
                     ctx.textAlign = "center";
                     ctx.textBaseline = "middle";
-                    ctx.fillStyle = "#ffffff";
-                    ctx.fillText(label, x, y - nodeSize - 8 / globalScale);
+
+                    const labelY = y - nodeSize - 7 / globalScale;
+
+                    ctx.fillStyle = isSelected || isHovered ? "#ffffff" : "rgba(212,212,216,0.85)";
+                    ctx.fillText(label, x, labelY);
                   }
                   ctx.restore();
                 }}
                 nodePointerAreaPaint={(node, color, ctx) => {
                   const gn = node as GraphNode;
-                  const x = gn.x ?? 0;
-                  const y = gn.y ?? 0;
                   ctx.fillStyle = color;
                   ctx.beginPath();
-                  ctx.arc(x, y, gn.type === "Paper" ? 24 : 20, 0, 2 * Math.PI, false);
+                  ctx.arc(gn.x ?? 0, gn.y ?? 0, getNodeRadius(gn) + 4, 0, 2 * Math.PI, false);
                   ctx.fill();
                 }}
               />
@@ -1041,7 +1381,10 @@ function App() {
                 graphData={displayGraphData}
                 nodeId="id"
                 nodeLabel={(node) => (node as GraphNode).label}
-                nodeVal={(node) => getNodeSize((node as GraphNode).type)}
+                nodeVal={(node) => {
+                  const r = getNodeRadius(node as GraphNode);
+                  return (r * r) / 25;
+                }}
                 nodeColor={(node) => {
                   const gn = node as GraphNode;
                   if (highlightNodes.size === 0) return getNodeColor(gn.type);
@@ -1059,11 +1402,11 @@ function App() {
                 backgroundColor="#09090b"
                 showNavInfo={true}
                 onNodeClick={(node) => handleNodeClick(node as GraphNode)}
-                onNodeHover={(node) => setHoverNodeId(node ? (node as GraphNode).id : null)}
+                onNodeHover={(node) => { hoverNodeIdRef.current = node ? (node as GraphNode).id : null; }}
                 onBackgroundClick={resetHighlight}
               />
             )}
-          </div>
+          </div>}
 
           {/* ── Details panel ── */}
           <aside className="details-panel">
@@ -1149,6 +1492,9 @@ function App() {
                           {paperInsight.is_oa && paperInsight.oa_url && (
                             <a className="action-link" href={paperInsight.oa_url} target="_blank" rel="noreferrer">Open Access PDF ↗</a>
                           )}
+                          {paperInsight.has_preprint && paperInsight.arxiv_url && (
+                            <a className="action-link" href={paperInsight.arxiv_url} target="_blank" rel="noreferrer">Preprint on arXiv ↗</a>
+                          )}
                         </div>
 
                         {/* OA badge + stats */}
@@ -1170,6 +1516,10 @@ function App() {
                             </div>
                           )}
                         </div>
+
+                        {paperInsight.citation_count_diverges && paperInsight.semantic_scholar_citation_count != null && (
+                          <p className="pi-citation-note">Semantic Scholar reports {paperInsight.semantic_scholar_citation_count.toLocaleString()} citations</p>
+                        )}
 
                         {/* OA status badge */}
                         {paperInsight.oa_status && (
@@ -1224,7 +1574,56 @@ function App() {
                         {paperInsight.venue && (
                           <div className="ai-block">
                             <span className="ai-block-label">Venue</span>
-                            <span className="ai-block-val">{paperInsight.venue}</span>
+                            <span className="ai-block-val">
+                              {paperInsight.venue}
+                              {paperInsight.provenance?.venue === "crossref" && (
+                                <span className="pi-provenance"> · via Crossref</span>
+                              )}
+                            </span>
+                          </div>
+                        )}
+
+                        {/* Publisher / Crossref metadata */}
+                        {(paperInsight.publisher || paperInsight.issn || paperInsight.license_url) && (
+                          <div className="ai-block">
+                            <span className="ai-block-label">Publisher</span>
+                            {paperInsight.publisher && (
+                              <span className="ai-block-val">{paperInsight.publisher}</span>
+                            )}
+                            {(paperInsight.issn || paperInsight.license_url) && (
+                              <div className="pi-meta-rows">
+                                {paperInsight.issn && (
+                                  <span className="pi-meta-line">ISSN {paperInsight.issn}</span>
+                                )}
+                                {paperInsight.license_url && (() => {
+                                  const url = paperInsight.license_url!;
+                                  const cc = url.match(/creativecommons\.org\/licenses\/([^/]+\/[^/]+)/);
+                                  const label = cc ? `CC ${cc[1].toUpperCase()}` : "View license";
+                                  return (
+                                    <span className="pi-meta-line">
+                                      License: <a className="ai-work-link" href={url} target="_blank" rel="noreferrer">{label} ↗</a>
+                                    </span>
+                                  );
+                                })()}
+                              </div>
+                            )}
+                            {paperInsight.provenance?.publisher === "crossref" && (
+                              <span className="pi-provenance">verified via Crossref</span>
+                            )}
+                          </div>
+                        )}
+
+                        {/* Funders (Crossref) */}
+                        {paperInsight.funder && paperInsight.funder.length > 0 && (
+                          <div className="ai-block">
+                            <span className="ai-block-label">Funders</span>
+                            <div className="pi-meta-rows">
+                              {paperInsight.funder.map((f, i) => (
+                                <span key={i} className="pi-meta-line">
+                                  {f.name}{f.award.length > 0 ? ` · ${f.award[0]}` : ""}
+                                </span>
+                              ))}
+                            </div>
                           </div>
                         )}
 
@@ -1288,6 +1687,71 @@ function App() {
                             </ol>
                           </div>
                         )}
+
+                        {/* Research Funding & Linked Outputs (OpenAIRE) */}
+                        {(() => {
+                          const fp = paperInsight.funding_projects ?? [];
+                          const ld = paperInsight.linked_datasets ?? [];
+                          const ls = paperInsight.linked_software ?? [];
+                          if (fp.length === 0 && ld.length === 0 && ls.length === 0) return null;
+                          return (
+                            <div className="ai-block">
+                              <span className="ai-block-label">Research Funding & Linked Outputs</span>
+                              <div className="cite-explain-body">
+                                {fp.length > 0 && (
+                                  <div className="cite-subsection">
+                                    <p className="cite-section-subtitle">Funding projects ({fp.length})</p>
+                                    {fp.map((proj, i) => (
+                                      <div key={i} className="cite-connection-row">
+                                        <span className="cite-connection-name">
+                                          {[proj.name, proj.acronym].filter(Boolean).join(" · ") || "Unnamed project"}
+                                        </span>
+                                        {proj.funder && (
+                                          <span className="cite-reason-tag">{proj.funder}</span>
+                                        )}
+                                      </div>
+                                    ))}
+                                    <p className="pi-provenance">via OpenAIRE</p>
+                                  </div>
+                                )}
+                                {ld.length > 0 && (
+                                  <div className="cite-subsection">
+                                    <p className="cite-section-subtitle">Linked datasets ({ld.length})</p>
+                                    {ld.map((ds, i) => (
+                                      <div key={i} className="cite-connection-row">
+                                        {ds.url ? (
+                                          <a className="ai-work-link" href={ds.url} target="_blank" rel="noreferrer">
+                                            {ds.title || ds.doi || "Dataset"} ↗
+                                          </a>
+                                        ) : (
+                                          <span className="cite-connection-name">{ds.title || ds.doi || "Dataset"}</span>
+                                        )}
+                                      </div>
+                                    ))}
+                                    <p className="pi-provenance">via OpenAIRE Scholexplorer</p>
+                                  </div>
+                                )}
+                                {ls.length > 0 && (
+                                  <div className="cite-subsection">
+                                    <p className="cite-section-subtitle">Linked software ({ls.length})</p>
+                                    {ls.map((sw, i) => (
+                                      <div key={i} className="cite-connection-row">
+                                        {sw.url ? (
+                                          <a className="ai-work-link" href={sw.url} target="_blank" rel="noreferrer">
+                                            {sw.title || "Software"} ↗
+                                          </a>
+                                        ) : (
+                                          <span className="cite-connection-name">{sw.title || "Software"}</span>
+                                        )}
+                                      </div>
+                                    ))}
+                                    <p className="pi-provenance">via OpenAIRE Scholexplorer</p>
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })()}
 
                         {/* Citation & Connection Explanation */}
                         {(() => {
@@ -1555,69 +2019,78 @@ function App() {
                 </ul>
               </div>
             )}
-            {/* ── AIRA Assistant ── */}
-            <div className="aira-chat">
-              <div className="chat-header" onClick={() => setIsChatCollapsed((c) => !c)}>
-                <span className="chat-header-title">AIRA Assistant</span>
-                <button className="chat-toggle-btn" aria-label="Toggle chat">
-                  {isChatCollapsed ? "▲" : "▼"}
-                </button>
-              </div>
-
-              {!isChatCollapsed && (
-                <>
-                  <div className="chat-suggestions">
-                    {suggestedQuestions.map((q, i) => (
-                      <button
-                        key={i}
-                        className="chat-suggestion-btn"
-                        onClick={() => void sendChat(q)}
-                        disabled={chatLoading}
-                      >
-                        {q}
-                      </button>
-                    ))}
-                  </div>
-
-                  <div className="chat-messages">
-                    {chatMessages.map((msg, i) => (
-                      <div key={i} className={`chat-message chat-message-${msg.role}`}>
-                        {msg.content}
-                      </div>
-                    ))}
-                    {chatLoading && (
-                      <div className="chat-message chat-message-assistant">
-                        <span className="chat-thinking">Thinking…</span>
-                      </div>
-                    )}
-                    <div ref={chatEndRef} />
-                  </div>
-
-                  <div className="chat-input-row">
-                    <input
-                      className="chat-input"
-                      value={chatInput}
-                      onChange={(e) => setChatInput(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter" && !chatLoading) void sendChat(chatInput);
-                      }}
-                      placeholder="Ask about this node or the graph…"
-                      disabled={chatLoading}
-                    />
-                    <button
-                      className="chat-send-btn"
-                      onClick={() => void sendChat(chatInput)}
-                      disabled={chatLoading || chatInput.trim() === ""}
-                    >
-                      Send
-                    </button>
-                  </div>
-                </>
-              )}
-            </div>
           </aside>
         </div>
       </section>
+
+      {/* ── AIRA Assistant floating popup ── */}
+      {!isChatCollapsed && (
+        <div className="chat-popup">
+          <div className="chat-popup-header">
+            <span className="chat-header-title">AIRA Assistant</span>
+            <button
+              className="chat-toggle-btn"
+              aria-label="Close chat"
+              onClick={() => setIsChatCollapsed(true)}
+            >
+              ×
+            </button>
+          </div>
+          <div className="chat-popup-suggestions">
+            {suggestedQuestions.map((q, i) => (
+              <button
+                key={i}
+                className="chat-suggestion-btn"
+                onClick={() => void sendChat(q)}
+                disabled={chatLoading}
+              >
+                {q}
+              </button>
+            ))}
+          </div>
+          <div className="chat-messages chat-popup-messages">
+            {chatMessages.map((msg, i) => (
+              <div key={i} className={`chat-message chat-message-${msg.role}`}>
+                {msg.content}
+              </div>
+            ))}
+            {chatLoading && (
+              <div className="chat-message chat-message-assistant">
+                <span className="chat-thinking">Thinking…</span>
+              </div>
+            )}
+            <div ref={chatEndRef} />
+          </div>
+          <div className="chat-popup-input-row">
+            <input
+              className="chat-input"
+              value={chatInput}
+              onChange={(e) => setChatInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !chatLoading) void sendChat(chatInput);
+              }}
+              placeholder="Ask about this node or the graph…"
+              disabled={chatLoading}
+            />
+            <button
+              className="chat-send-btn"
+              onClick={() => void sendChat(chatInput)}
+              disabled={chatLoading || chatInput.trim() === ""}
+            >
+              Send
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Chat trigger button ── */}
+      <button
+        className={`chat-fab${!isChatCollapsed ? " chat-fab-open" : ""}`}
+        onClick={() => setIsChatCollapsed((c) => !c)}
+        aria-label="Toggle AIRA Assistant"
+      >
+        {isChatCollapsed ? "AIRA" : "↓"}
+      </button>
     </main>
   );
 }

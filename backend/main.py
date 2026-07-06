@@ -1,7 +1,11 @@
+import asyncio
+import difflib
 import os
 import re
+import xml.etree.ElementTree as ET
 from typing import Any
 
+import db
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -45,6 +49,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Initialize the local SQLite cache (creates backend/data/aira_scholar.db if missing).
+# Runs once when uvicorn imports this module.  A failure leaves the app in live-only mode.
+db.init_db()
 
 
 @app.get("/")
@@ -105,45 +113,83 @@ async def get_oulu_openalex_graph(
     to_year: int | None = None,
 ):
     api_key = os.getenv("OPENALEX_API_KEY")
+    requested_limit = max(1, limit)
+    _MAX_PAGES = 20   # safety cap: never more than 20 × 100 = 2000 results per call
+    _PAGE_SIZE = 100  # OpenAlex per-page maximum
 
-    # OpenAlex per-page max is 100.
-    safe_limit = max(1, min(limit, 100))
+    # Graph search result cache — 1-hour TTL (search results are time-sensitive)
+    _cache_key = (
+        f"limit={requested_limit}|search={search or ''}|"
+        f"from={from_year or ''}|to={to_year or ''}"
+    )
+    _cached = db.get_cached_raw("graph_search", _cache_key, ttl_hours=1)
+    if _cached is not None:
+        print(f"[graph] cache hit ({_cache_key[:70]})")
+        return _cached
 
     filters = ["authorships.institutions.ror:https://ror.org/03yj89h83"]
-
     if from_year:
         filters.append(f"from_publication_date:{from_year}-01-01")
-
     if to_year:
         filters.append(f"to_publication_date:{to_year}-12-31")
 
-    params: dict[str, Any] = {
+    base_params: dict[str, Any] = {
         "filter": ",".join(filters),
-        "per-page": safe_limit,
+        "per-page": _PAGE_SIZE,
     }
-
     if search:
-        params["search"] = search
+        base_params["search"] = search
     else:
-        params["sort"] = "cited_by_count:desc"
-
+        base_params["sort"] = "cited_by_count:desc"
     if api_key:
-        params["api_key"] = api_key
+        base_params["api_key"] = api_key
+
+    # Cursor-based pagination — accumulate until limit, exhausted, or safety cap
+    all_works: list[dict[str, Any]] = []
+    _pages_fetched = 0
+    _cursor = "*"
+    _limit_reason = "no_more_results"
 
     async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(
-            "https://api.openalex.org/works",
-            params=params,
-        )
-        response.raise_for_status()
-        data = response.json()
+        while len(all_works) < requested_limit:
+            _resp = await client.get(
+                "https://api.openalex.org/works",
+                params={**base_params, "cursor": _cursor},
+            )
+            _resp.raise_for_status()
+            _page_data = _resp.json()
+
+            _page_results = _page_data.get("results", [])
+            all_works.extend(_page_results)
+            _pages_fetched += 1
+
+            _next_cursor = (_page_data.get("meta") or {}).get("next_cursor")
+            if not _page_results or not _next_cursor:
+                _limit_reason = "no_more_results"
+                break
+
+            if _pages_fetched >= _MAX_PAGES:
+                _limit_reason = "safety_cap_reached"
+                break
+
+            _cursor = _next_cursor
+
+    # Trim any overshoot from the last full page fetch
+    all_works = all_works[:requested_limit]
+    if len(all_works) >= requested_limit:
+        _limit_reason = "exact_match"
+    _actual_count = len(all_works)
+    print(
+        f"[graph] {_actual_count}/{requested_limit} works in {_pages_fetched} page(s)"
+        f" — {_limit_reason}"
+    )
 
     nodes = {}
     edges = []
     paper_to_references: dict[str, list[str]] = {}
     referenced_ids: set[str] = set()
 
-    for work in data.get("results", []):
+    for work in all_works:
         paper_id = work.get("id", "").replace("https://openalex.org/", "")
         title = work.get("title") or "Untitled paper"
         year = work.get("publication_year")
@@ -318,15 +364,26 @@ async def get_oulu_openalex_graph(
                 }
             )
 
-    return {
+    _graph_result = {
         "nodes": list(nodes.values()),
         "edges": edges,
+        "requested_limit": requested_limit,
+        "actual_count": _actual_count,
+        "limit_reason": _limit_reason,
+        "pages_fetched": _pages_fetched,
     }
+    db.save_raw("graph_search", _cache_key, _graph_result)
+    return _graph_result
 
 
 @app.get("/author/openalex/{author_id}")
 async def get_author_insight(author_id: str):
     """Return enriched author metadata and recent works from OpenAlex."""
+    # Cache-first: serve from SQLite if the record is fresh
+    cached = db.get_cached_author(author_id)
+    if cached is not None:
+        return cached
+
     api_key = os.getenv("OPENALEX_API_KEY")
     base_params: dict[str, Any] = {}
     if api_key:
@@ -402,7 +459,7 @@ async def get_author_insight(author_id: str):
             }
         )
 
-    return {
+    result = {
         "id": author_id,
         "display_name": author.get("display_name", ""),
         "orcid": author.get("orcid"),
@@ -414,39 +471,909 @@ async def get_author_insight(author_id: str):
         "topics": topics,
         "counts_by_year": counts_by_year,
         "recent_works": recent_works,
+        "provenance": {f: "openalex" for f in (
+            "display_name", "orcid", "works_count", "cited_by_count",
+            "summary_stats", "last_known_institutions", "topics",
+            "counts_by_year", "recent_works",
+        )},
     }
+    db.save_author(author_id, result, raw_openalex=author)
+    return result
 
 
 # ── PDF / full-text helpers ───────────────────────────────────────────────────
 
-# In-memory cache: work_id → extracted text.  Survives the session; cleared on restart.
-_pdf_cache: dict[str, str] = {}
+# In-memory session cache: work_id -> full response dict.  Cleared on restart.
+_pdf_cache: dict[str, dict[str, Any]] = {}
 
 
 def _best_pdf_url(work: dict) -> str | None:
-    """Return the best open-access PDF URL from an OpenAlex work record, or None."""
-    # 1. best_oa_location.pdf_url
+    """Return the single best OA PDF URL for the has_full_text_available flag."""
     best = work.get("best_oa_location") or {}
     if best.get("pdf_url"):
         return str(best["pdf_url"])
-    # 2. open_access.oa_url (may be a direct PDF or a landing page)
     oa = work.get("open_access") or {}
     if oa.get("is_oa") and oa.get("oa_url"):
         return str(oa["oa_url"])
-    # 3. primary_location.pdf_url
     primary = work.get("primary_location") or {}
     if primary.get("pdf_url"):
         return str(primary["pdf_url"])
-    # 4. first location that has a pdf_url
     for loc in (work.get("locations") or []):
         if loc.get("pdf_url"):
             return str(loc["pdf_url"])
     return None
 
 
+def _collect_oa_pdf_candidates(work: dict[str, Any]) -> list[str]:
+    """Build an ordered list of OA PDF candidate URLs from all available locations.
+
+    Direct PDF links are tried before landing pages (which often return HTML).
+    OA locations are tried before non-OA ones.
+    """
+    pdf_urls: list[str] = []
+    landing_urls: list[str] = []
+
+    def _add_pdf(url: str | None) -> None:
+        if url and url not in pdf_urls:
+            pdf_urls.append(url)
+
+    def _add_landing(url: str | None) -> None:
+        if url and url not in landing_urls and url not in pdf_urls:
+            landing_urls.append(url)
+
+    best = work.get("best_oa_location") or {}
+    _add_pdf(best.get("pdf_url"))
+    _add_landing(best.get("landing_page_url"))
+
+    for loc in (work.get("locations") or []):
+        if loc.get("is_oa"):
+            _add_pdf(loc.get("pdf_url"))
+            _add_landing(loc.get("landing_page_url"))
+
+    primary = work.get("primary_location") or {}
+    _add_pdf(primary.get("pdf_url"))
+
+    oa = work.get("open_access") or {}
+    if oa.get("is_oa"):
+        _add_landing(oa.get("oa_url"))
+
+    for loc in (work.get("locations") or []):
+        if not loc.get("is_oa"):
+            _add_pdf(loc.get("pdf_url"))
+
+    return pdf_urls + landing_urls
+
+
+def _collect_urls_recursive(obj: Any, found: list[str], depth: int = 0) -> None:
+    """Recursively extract string values from known URL-bearing keys."""
+    if depth > 10 or len(found) >= 20:
+        return
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in ("fulltext", "url", "URL", "pdf_url") and isinstance(v, str) and v.startswith("http"):
+                found.append(v)
+            else:
+                _collect_urls_recursive(v, found, depth + 1)
+    elif isinstance(obj, list):
+        for item in obj:
+            _collect_urls_recursive(item, found, depth + 1)
+
+
+async def _fetch_crossref_metadata(doi: str) -> dict[str, Any] | None:
+    """Return the Crossref 'message' dict for a DOI; cache in source_raw_cache.
+
+    Uses CROSSREF_MAILTO env var for the polite-pool User-Agent.
+    Returns None on any failure so callers can gracefully skip enrichment.
+    """
+    cached = db.get_cached_raw("crossref", doi)
+    if cached is not None:
+        return cached
+    mailto = os.getenv("CROSSREF_MAILTO", "research@oulu.fi")
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"https://api.crossref.org/works/{doi}",
+                headers={"User-Agent": f"AIRA-Scholar/1.0 (mailto:{mailto})"},
+            )
+        if resp.status_code != 200:
+            print(f"[crossref] {doi} -> HTTP {resp.status_code}")
+            return None
+        msg = resp.json().get("message")
+        if not isinstance(msg, dict):
+            return None
+        db.save_raw("crossref", doi, msg)
+        print(f"[crossref] fetched metadata for {doi}")
+        return msg
+    except Exception as exc:
+        print(f"[crossref] lookup skipped for {doi}: {type(exc).__name__}")
+        return None
+
+
+async def _fetch_crossref_tdm_urls(doi: str) -> list[str]:
+    """Return TDM/full-text URLs from Crossref for the given DOI.  Empty on any error."""
+    msg = await _fetch_crossref_metadata(doi)
+    if msg is None:
+        return []
+    links = msg.get("link") or []
+    urls: list[str] = []
+    for lk in links:
+        url = lk.get("URL")
+        if not url:
+            continue
+        ct = lk.get("content-type", "")
+        intended = lk.get("intended-application", "")
+        if "text-mining" in intended or "pdf" in ct.lower():
+            urls.append(url)
+    print(f"[fulltext] Crossref found {len(urls)} TDM URL(s) for {doi}")
+    return urls
+
+
+def _extract_crossref_fields(msg: dict[str, Any]) -> dict[str, Any]:
+    """Extract priority metadata fields from a Crossref 'message' dict."""
+    titles = msg.get("title") or []
+    title = titles[0].strip() if titles else None
+
+    ct = msg.get("container-title") or []
+    venue = ct[0].strip() if ct else None
+
+    publisher = msg.get("publisher") or None
+
+    issns = msg.get("ISSN") or []
+    issn = issns[0] if issns else None
+
+    licenses = msg.get("license") or []
+    license_url = licenses[0].get("URL") if licenses else None
+
+    funders: list[dict[str, Any]] = []
+    for f in (msg.get("funder") or []):
+        name = f.get("name")
+        if name:
+            funders.append({"name": name, "award": f.get("award") or []})
+
+    pub_year: int | None = None
+    try:
+        date_src = msg.get("published") or msg.get("published-print") or {}
+        parts = date_src.get("date-parts") or [[None]]
+        raw = parts[0][0] if parts and parts[0] else None
+        pub_year = int(raw) if raw is not None else None
+    except (IndexError, TypeError, ValueError):
+        pass
+
+    work_type = msg.get("type") or None
+
+    raw_doi = (msg.get("DOI") or "").lower()
+    # Normalise to full URL to match OpenAlex convention
+    doi_url = f"https://doi.org/{raw_doi}" if raw_doi else None
+
+    is_referenced_by_count = msg.get("is-referenced-by-count")
+
+    return {
+        "title": title,
+        "venue": venue,
+        "publisher": publisher,
+        "issn": issn,
+        "license_url": license_url,
+        "funder": funders if funders else None,
+        "publication_year": pub_year,
+        "type": work_type,
+        "doi": doi_url,
+        "is_referenced_by_count": is_referenced_by_count,
+    }
+
+
+def _merge_crossref_fields(
+    oa_result: dict[str, Any], cr_fields: dict[str, Any]
+) -> dict[str, Any]:
+    """Merge Crossref priority fields into oa_result, updating provenance.
+
+    Rules:
+    - title, doi, venue, publication_year, type: Crossref wins when non-empty
+    - publisher, issn, license_url, funder: Crossref only (no OA equivalent)
+    - cited_by_count: OpenAlex always primary; crossref_citation_count added as
+      a cross-check field alongside citation_count_diverges (>20% relative diff)
+    """
+    result = dict(oa_result)
+    prov: dict[str, str] = dict(result.get("provenance") or {})
+
+    for field in ("title", "doi", "venue", "publication_year", "type"):
+        cr_val = cr_fields.get(field)
+        if cr_val is not None and cr_val != "":
+            result[field] = cr_val
+            prov[field] = "crossref"
+
+    for field in ("publisher", "issn", "license_url", "funder"):
+        cr_val = cr_fields.get(field)
+        if cr_val is not None:
+            result[field] = cr_val
+            prov[field] = "crossref"
+
+    cr_count = cr_fields.get("is_referenced_by_count")
+    if cr_count is not None:
+        result["crossref_citation_count"] = cr_count
+        prov["crossref_citation_count"] = "crossref"
+        oa_count = oa_result.get("cited_by_count") or 0
+        if oa_count > 0 and cr_count > 0:
+            result["citation_count_diverges"] = (
+                abs(oa_count - cr_count) / max(oa_count, cr_count) > 0.20
+            )
+        else:
+            result["citation_count_diverges"] = False
+
+    result["provenance"] = prov
+    return result
+
+
+# ── Semantic Scholar enrichment ───────────────────────────────────────────────
+
+async def _fetch_semantic_scholar_metadata(doi: str) -> dict[str, Any] | None:
+    """Return the Semantic Scholar paper record for a DOI; cache in source_raw_cache.
+
+    Stores {"_not_found": True} on 404 so we don't re-fetch within the TTL window.
+    Returns None on any failure (404, timeout, rate-limit, malformed response).
+    """
+    cached = db.get_cached_raw("semantic_scholar", doi)
+    if cached is not None:
+        return None if cached.get("_not_found") else cached
+
+    api_key = os.getenv("SEMANTIC_SCHOLAR_API_KEY")
+    headers: dict[str, str] = {"User-Agent": "AIRA-Scholar/1.0 (academic research tool)"}
+    if api_key:
+        headers["x-api-key"] = api_key
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}",
+                params={"fields": "paperId,citationCount,referenceCount,abstract,externalIds"},
+                headers=headers,
+            )
+        if resp.status_code == 404:
+            db.save_raw("semantic_scholar", doi, {"_not_found": True})
+            print(f"[s2] {doi} not in Semantic Scholar")
+            return None
+        if resp.status_code != 200:
+            print(f"[s2] {doi} -> HTTP {resp.status_code}")
+            return None
+        data = resp.json()
+        if not isinstance(data, dict) or not data.get("paperId"):
+            return None
+        db.save_raw("semantic_scholar", doi, data)
+        key_note = f"(key ...{api_key[-4:]})" if api_key else "(unauthenticated)"
+        print(f"[s2] fetched metadata for {doi} {key_note}")
+        return data
+    except Exception as exc:
+        print(f"[s2] lookup skipped for {doi}: {type(exc).__name__}")
+        return None
+
+
+async def _fetch_semantic_scholar_recommendations(paper_id: str) -> list[dict[str, Any]] | None:
+    """Return up to 5 recommended papers from Semantic Scholar; cached by paper_id."""
+    cache_key = f"recs:{paper_id}"
+    cached = db.get_cached_raw("semantic_scholar", cache_key)
+    if cached is not None:
+        return None if cached.get("_not_found") else cached.get("recommended_papers")
+
+    api_key = os.getenv("SEMANTIC_SCHOLAR_API_KEY")
+    headers: dict[str, str] = {"User-Agent": "AIRA-Scholar/1.0 (academic research tool)"}
+    if api_key:
+        headers["x-api-key"] = api_key
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"https://api.semanticscholar.org/recommendations/v1/papers/forpaper/{paper_id}",
+                params={"fields": "title,year,externalIds", "limit": "5"},
+                headers=headers,
+            )
+        if resp.status_code in (400, 404):
+            db.save_raw("semantic_scholar", cache_key, {"_not_found": True})
+            return None
+        if resp.status_code != 200:
+            return None
+        papers = resp.json().get("recommendedPapers") or []
+        if papers:
+            db.save_raw("semantic_scholar", cache_key, {"recommended_papers": papers})
+        return papers or None
+    except Exception as exc:
+        print(f"[s2] recommendations skipped for {paper_id}: {type(exc).__name__}")
+        return None
+
+
+def _extract_semantic_scholar_fields(data: dict[str, Any]) -> dict[str, Any]:
+    """Extract fields of interest from a Semantic Scholar paper record."""
+    return {
+        "paper_id": data.get("paperId"),
+        "citation_count": data.get("citationCount"),
+        "reference_count": data.get("referenceCount"),
+        "abstract": data.get("abstract"),
+        "external_ids": data.get("externalIds") or {},
+    }
+
+
+def _merge_semantic_scholar_fields(
+    result: dict[str, Any],
+    ss_fields: dict[str, Any],
+    related: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Merge Semantic Scholar cross-check data into result.
+
+    Rules:
+    - Never overrides title, doi, venue, publisher, license, funder
+    - Abstract: fills gap only when both OpenAlex and Crossref left it empty
+    - Citation count: stored as semantic_scholar_citation_count for comparison;
+      recalculates citation_count_diverges and citation_count_sources across
+      all available sources (OpenAlex primary — never overridden)
+    - Related papers: stored under semantic_scholar_related, separate from
+      the OpenAlex-based cited/referenced lists
+    """
+    result = dict(result)
+    prov: dict[str, str] = dict(result.get("provenance") or {})
+
+    if ss_fields.get("paper_id"):
+        result["semantic_scholar_paper_id"] = ss_fields["paper_id"]
+        prov["semantic_scholar_paper_id"] = "semantic_scholar"
+
+    # Abstract gap-fill: only when neither OpenAlex nor Crossref supplied one
+    ss_abstract = ss_fields.get("abstract")
+    if ss_abstract and not result.get("abstract"):
+        result["abstract"] = ss_abstract
+        prov["abstract"] = "semantic_scholar"
+
+    ss_count = ss_fields.get("citation_count")
+    if ss_count is not None:
+        result["semantic_scholar_citation_count"] = ss_count
+        prov["semantic_scholar_citation_count"] = "semantic_scholar"
+
+    # Always record that a cross-check was performed
+    prov["citation_cross_check"] = "semantic_scholar"
+
+    # Build complete citation_count_sources from all enrichment rounds
+    oa_count: int = result.get("cited_by_count") or 0
+    sources: dict[str, int] = {"openalex": oa_count}
+    if result.get("crossref_citation_count") is not None:
+        sources["crossref"] = int(result["crossref_citation_count"])
+    if ss_count is not None:
+        sources["semantic_scholar"] = int(ss_count)
+    result["citation_count_sources"] = sources
+
+    # Diverges if any non-OA source differs by >20% relative to the larger value
+    diverging: list[str] = [
+        src
+        for src, cnt in sources.items()
+        if src != "openalex" and oa_count > 0 and cnt > 0
+        and abs(oa_count - cnt) / max(oa_count, cnt) > 0.20
+    ]
+    result["citation_count_diverges"] = len(diverging) > 0
+    if diverging:
+        result["citation_count_diverging_sources"] = diverging
+    elif "citation_count_diverging_sources" in result:
+        del result["citation_count_diverging_sources"]
+
+    # Related papers — structurally separate from OpenAlex cited/referenced lists
+    if related:
+        result["semantic_scholar_related"] = [
+            {
+                "title": p.get("title") or "Untitled",
+                "year": p.get("year"),
+                "doi": (p.get("externalIds") or {}).get("DOI"),
+                "paper_id": p.get("paperId"),
+            }
+            for p in related
+        ]
+        prov["semantic_scholar_related"] = "semantic_scholar"
+
+    result["provenance"] = prov
+    return result
+
+
+# ── arXiv preprint enrichment ─────────────────────────────────────────────────
+
+_ARXIV_ATOM_NS = "http://www.w3.org/2005/Atom"
+_ARXIV_EXT_NS = "http://arxiv.org/schemas/atom"
+# Matches new-format (2301.00000) and old-format (cs/0701001) arXiv IDs in URLs.
+_ARXIV_ID_RE = re.compile(
+    r"arxiv\.org/(?:abs|pdf)/([a-z\-]+/\d{7}|[0-9]{4}\.[0-9]{4,5})",
+    re.I,
+)
+
+
+def _extract_arxiv_id_from_url(url: str) -> str | None:
+    """Return the bare arXiv ID (no version suffix) from any arxiv.org URL, or None."""
+    m = _ARXIV_ID_RE.search(url)
+    return m.group(1) if m else None
+
+
+def _extract_arxiv_from_openalex(work: dict[str, Any]) -> dict[str, Any] | None:
+    """Scan OpenAlex locations for an existing arXiv link — no API call needed.
+
+    Returns a preprint dict with confidence='openalex_linked', or None if not found.
+    """
+    locations: list[Any] = list(work.get("locations") or [])
+    for key in ("best_oa_location", "primary_location"):
+        loc = work.get(key)
+        if isinstance(loc, dict):
+            locations.append(loc)
+
+    for loc in locations:
+        if not isinstance(loc, dict):
+            continue
+        for url_field in ("landing_page_url", "pdf_url"):
+            url = loc.get(url_field) or ""
+            if "arxiv.org" not in url:
+                continue
+            arxiv_id = _extract_arxiv_id_from_url(url)
+            if arxiv_id:
+                return {
+                    "has_preprint": True,
+                    "preprint_match_confidence": "openalex_linked",
+                    "arxiv_id": arxiv_id,
+                    "arxiv_url": f"https://arxiv.org/abs/{arxiv_id}",
+                    "arxiv_pdf_url": f"https://arxiv.org/pdf/{arxiv_id}",
+                }
+    return None
+
+
+def _parse_arxiv_entry(entry: ET.Element) -> dict[str, Any] | None:
+    """Parse one <entry> from an arXiv Atom feed into a plain dict."""
+    ns = _ARXIV_ATOM_NS
+    raw_id = getattr(entry.find(f"{{{ns}}}id"), "text", "") or ""
+    arxiv_id = _extract_arxiv_id_from_url(raw_id)
+    if not arxiv_id:
+        return None
+
+    pdf_url: str | None = None
+    for link in entry.findall(f"{{{ns}}}link"):
+        if link.get("title") == "pdf" or "pdf" in (link.get("type") or ""):
+            pdf_url = link.get("href")
+            break
+
+    title_elem = entry.find(f"{{{ns}}}title")
+    title = (title_elem.text or "").strip() if title_elem is not None else ""
+
+    # arXiv-specific doi element — used to verify DOI-based searches
+    doi_elem = entry.find(f"{{{_ARXIV_EXT_NS}}}doi")
+    linked_doi = (doi_elem.text or "").strip().lower() if doi_elem is not None else ""
+
+    return {
+        "arxiv_id": arxiv_id,
+        "arxiv_url": f"https://arxiv.org/abs/{arxiv_id}",
+        "arxiv_pdf_url": pdf_url or f"https://arxiv.org/pdf/{arxiv_id}",
+        "arxiv_published_date": getattr(entry.find(f"{{{ns}}}published"), "text", None),
+        "arxiv_updated_date": getattr(entry.find(f"{{{ns}}}updated"), "text", None),
+        "_title": title,
+        "_linked_doi": linked_doi,
+    }
+
+
+async def _search_arxiv(query: str, max_results: int = 3) -> list[dict[str, Any]]:
+    """Run an arXiv API query; return parsed entries. Empty list on any failure."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                "http://export.arxiv.org/api/query",
+                params={"search_query": query, "max_results": str(max_results)},
+                headers={"User-Agent": "AIRA-Scholar/1.0 (University of Oulu research tool)"},
+            )
+        if resp.status_code != 200:
+            print(f"[arxiv] HTTP {resp.status_code} for query: {query[:70]}")
+            return []
+        root = ET.fromstring(resp.text)
+        entries = root.findall(f"{{{_ARXIV_ATOM_NS}}}entry")
+        results = [_parse_arxiv_entry(e) for e in entries]
+        return [r for r in results if r is not None]
+    except Exception as exc:
+        print(f"[arxiv] search error ({type(exc).__name__}): {query[:70]}")
+        return []
+
+
+def _normalize_title(title: str) -> str:
+    """Lowercase, strip punctuation, collapse whitespace — for similarity checks."""
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9\s]", "", title.lower())).strip()
+
+
+async def _fetch_arxiv_preprint(doi: str | None, title: str | None) -> dict[str, Any]:
+    """DOI-then-title arXiv search. Always returns a dict (never raises, never None).
+
+    Result fields: has_preprint (bool), preprint_match_confidence, and when
+    has_preprint=True: arxiv_id, arxiv_url, arxiv_pdf_url, arxiv_published_date,
+    arxiv_updated_date.
+    """
+    doi_clean = (doi or "").replace("https://doi.org/", "").replace("http://doi.org/", "").strip() or None
+    cache_key = (
+        f"doi:{doi_clean}" if doi_clean
+        else (f"title:{_normalize_title(title)[:100]}" if title else None)
+    )
+    _no_match: dict[str, Any] = {"has_preprint": False, "preprint_match_confidence": "none"}
+
+    if cache_key:
+        cached = db.get_cached_raw("arxiv", cache_key)
+        if cached is not None:
+            return cached
+
+    # 1. DOI search — verify by matching the arxiv:doi element when present
+    if doi_clean:
+        entries = await _search_arxiv(f'all:"{doi_clean}"', max_results=5)
+        for entry in entries:
+            linked = entry.get("_linked_doi", "")
+            # Accept if arXiv explicitly records this DOI, or if it's the only result
+            if linked == doi_clean.lower() or (not linked and len(entries) == 1):
+                result: dict[str, Any] = {
+                    k: v for k, v in entry.items() if not k.startswith("_")
+                }
+                result["has_preprint"] = True
+                result["preprint_match_confidence"] = "doi_match"
+                if cache_key:
+                    db.save_raw("arxiv", cache_key, result)
+                print(f"[arxiv] DOI match: {doi_clean} -> {entry['arxiv_id']}")
+                return result
+        if entries:
+            print(f"[arxiv] DOI search returned {len(entries)} result(s) but none verified for: {doi_clean}")
+        else:
+            print(f"[arxiv] DOI search found nothing for: {doi_clean}")
+
+    # 2. Title fallback — require >=90% normalized similarity
+    if title:
+        title_norm = _normalize_title(title)
+        entries = await _search_arxiv(f'ti:"{title}"', max_results=5)
+        best_ratio = 0.0
+        best_entry: dict[str, Any] | None = None
+        for entry in entries:
+            entry_norm = _normalize_title(entry.get("_title") or "")
+            if not entry_norm:
+                continue
+            ratio = difflib.SequenceMatcher(None, title_norm, entry_norm).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_entry = entry
+
+        if best_entry and best_ratio >= 0.90:
+            result = {k: v for k, v in best_entry.items() if not k.startswith("_")}
+            result["has_preprint"] = True
+            result["preprint_match_confidence"] = "title_fuzzy_match"
+            if cache_key:
+                db.save_raw("arxiv", cache_key, result)
+            print(f"[arxiv] title match (sim={best_ratio:.2f}): {best_entry['arxiv_id']}")
+            return result
+
+        if best_entry:
+            print(f"[arxiv] title best sim={best_ratio:.2f} < 0.90, rejected: {title[:60]!r}")
+        else:
+            print(f"[arxiv] title search found nothing for: {title[:60]!r}")
+
+    if cache_key:
+        db.save_raw("arxiv", cache_key, _no_match)
+    return _no_match
+
+
+def _merge_arxiv_fields(result: dict[str, Any], arxiv_data: dict[str, Any]) -> dict[str, Any]:
+    """Add arXiv preprint linkage fields to result. Purely additive — never overrides."""
+    result = dict(result)
+    prov: dict[str, str] = dict(result.get("provenance") or {})
+
+    confidence = arxiv_data.get("preprint_match_confidence", "none")
+    result["has_preprint"] = arxiv_data.get("has_preprint", False)
+    result["preprint_match_confidence"] = confidence
+
+    if result["has_preprint"]:
+        for field in ("arxiv_id", "arxiv_url", "arxiv_pdf_url",
+                      "arxiv_published_date", "arxiv_updated_date"):
+            val = arxiv_data.get(field)
+            if val is not None:
+                result[field] = val
+        prov["preprint_linkage"] = "openalex" if confidence == "openalex_linked" else "arxiv"
+
+    result["provenance"] = prov
+    return result
+
+
+# ── OpenAIRE Graph API v2 enrichment ─────────────────────────────────────────
+
+_SCHOLEX_UA = "AIRA-Scholar/1.0 (University of Oulu research tool; contact: research@oulu.fi)"
+
+
+async def _fetch_scholexplorer_datasets(doi: str) -> dict[str, Any] | None:
+    """Query OpenAIRE Scholexplorer v2 for linked datasets/software for a DOI.
+
+    Cache key: "openaire_scholexplorer" / doi.
+    Paginates up to 3 pages (300 links) and filters for target.Type "dataset" / "software".
+    Returns {"datasets": [...], "software": [...]} on success;
+    {"_not_found": True} (cached) when no linked outputs exist;
+    None on network/HTTP errors (not cached — will retry next request). Never raises.
+    """
+    cached = db.get_cached_raw("openaire_scholexplorer", doi)
+    if cached is not None:
+        return None if cached.get("_not_found") else cached
+
+    datasets: list[dict[str, Any]] = []
+    software_list: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            page = 0
+            max_pages = 3
+            while page < max_pages:
+                resp = await client.get(
+                    "https://api.scholexplorer.openaire.eu/v2/Links",
+                    params={"sourcePid": doi, "page": str(page), "size": "100"},
+                    headers={"User-Agent": _SCHOLEX_UA},
+                )
+                if resp.status_code != 200:
+                    print(f"[scholexplorer] {doi} -> HTTP {resp.status_code}")
+                    break
+                body = resp.json()
+                links: list[dict[str, Any]] = body.get("result") or []
+                total_pages: int = body.get("totalPages") or 1
+
+                for link in links:
+                    target = link.get("target") or {}
+                    target_type = (target.get("Type") or "").lower()
+                    if target_type not in ("dataset", "software"):
+                        continue
+
+                    identifiers: list[dict[str, Any]] = target.get("Identifier") or []
+                    doi_entry = next(
+                        (i for i in identifiers if isinstance(i, dict) and i.get("IDScheme", "").lower() == "doi"),
+                        None,
+                    )
+                    # Prefer DOI as the stable identifier; fall back to openaireIdentifier.
+                    openaire_id = (doi_entry["ID"] if doi_entry else None) or next(
+                        (i["ID"] for i in identifiers if isinstance(i, dict) and "openaire" in i.get("IDScheme", "").lower()),
+                        None,
+                    )
+                    if not openaire_id or openaire_id in seen_ids:
+                        continue
+                    seen_ids.add(openaire_id)
+
+                    doi_value: str | None = doi_entry["ID"] if doi_entry else None
+                    url: str | None = (doi_entry.get("IDURL") if doi_entry else None) or next(
+                        (i.get("IDURL") for i in identifiers if isinstance(i, dict) and i.get("IDURL")),
+                        None,
+                    )
+                    item = {
+                        "id": openaire_id,
+                        "title": target.get("Title") or None,
+                        "url": url,
+                        "doi": doi_value,
+                    }
+                    if target_type == "dataset":
+                        datasets.append(item)
+                    else:
+                        software_list.append(item)
+
+                page += 1
+                if page >= total_pages:
+                    break
+
+        if not datasets and not software_list:
+            db.save_raw("openaire_scholexplorer", doi, {"_not_found": True})
+            print(f"[scholexplorer] {doi} — no linked datasets/software")
+            return None
+
+        result_payload = {"datasets": datasets, "software": software_list}
+        db.save_raw("openaire_scholexplorer", doi, result_payload)
+        print(
+            f"[scholexplorer] {doi}: {len(datasets)} dataset(s), "
+            f"{len(software_list)} software item(s)"
+        )
+        return result_payload
+
+    except Exception as exc:
+        print(f"[scholexplorer] lookup skipped for {doi}: {type(exc).__name__}: {exc}")
+        return None
+
+
+async def _fetch_openaire_funding(doi: str) -> dict[str, Any] | None:
+    """Query OpenAIRE Graph API v2 for a DOI; return projects/funders/datasets/software.
+
+    Cache key: "openaire_funding" / doi.
+    Returns None on any failure; returns {"_not_found": True} (cached) when OpenAIRE
+    has no record for the DOI so we don't re-fetch within the TTL window.
+    Never raises.
+    """
+    cached = db.get_cached_raw("openaire_funding", doi)
+    if cached is not None:
+        return None if cached.get("_not_found") else cached
+
+    _UA = "AIRA-Scholar/1.0 (University of Oulu research tool; contact: research@oulu.fi)"
+    try:
+        async with httpx.AsyncClient(timeout=9.0) as client:
+            resp = await client.get(
+                "https://api.openaire.eu/graph/v2/researchProducts",
+                # OpenAIRE Graph API v2 uses "pid" for persistent-identifier lookup;
+                # "doi" is not a valid parameter (confirmed from API error message).
+                params={"pid": doi, "pageSize": "5"},
+                headers={"User-Agent": _UA},
+            )
+        if resp.status_code != 200:
+            print(f"[openaire] {doi} -> HTTP {resp.status_code}")
+            return None
+
+        body = resp.json()
+        results: list[dict[str, Any]] = body.get("results") or []
+
+        if not results:
+            db.save_raw("openaire_funding", doi, {"_not_found": True})
+            print(f"[openaire] {doi} — no results from Graph API v2")
+            return None
+
+        # Find best match: prefer publication with exact DOI in its pids list.
+        # The field is "pids" (list) in the v2 response, not "pid".
+        doi_lower = doi.lower()
+        best: dict[str, Any] | None = None
+        for item in results:
+            for pid in (item.get("pids") or []):
+                if (
+                    isinstance(pid, dict)
+                    and pid.get("scheme", "").lower() == "doi"
+                    and pid.get("value", "").lower() == doi_lower
+                ):
+                    if item.get("type") == "publication" or best is None:
+                        best = item
+                    break
+        if best is None:
+            best = results[0]
+
+        openaire_id: str | None = best.get("id")
+
+        # ── Projects + funders ──────────────────────────────────────────────
+        # In Graph API v2, each project's "funder" field is a plain string
+        # (the funder name), not a nested dict — e.g. "European Commission".
+        projects: list[dict[str, Any]] = []
+        for proj in (best.get("projects") or []):
+            if not isinstance(proj, dict):
+                continue
+            proj_id = proj.get("id")
+            if not proj_id:
+                continue
+            funder_name: str | None = proj.get("funder") or None
+            projects.append(
+                {
+                    "id": proj_id,
+                    "name": proj.get("title"),
+                    "acronym": proj.get("acronym"),
+                    # start/end dates and URL are not in the embedded project object;
+                    # they would require a separate /projects/{id} lookup.
+                    "startDate": None,
+                    "endDate": None,
+                    "websiteUrl": None,
+                    "funder": {
+                        # No separate funder ID in embedded data — use name as stable key.
+                        "id": funder_name,
+                        "name": funder_name,
+                        "shortName": None,
+                    },
+                }
+            )
+
+        # ── Related datasets + software ─────────────────────────────────────
+        # Graph API v2 research-product response has no `relations` field; linked
+        # datasets/software are not accessible from the embedded publication record.
+        # Both lists are always empty from this endpoint.
+        datasets: list[dict[str, Any]] = []
+        software_list: list[dict[str, Any]] = []
+
+        result = {
+            "openaire_id": openaire_id,
+            "projects": projects,
+            "datasets": datasets,
+            "software": software_list,
+        }
+        db.save_raw("openaire_funding", doi, result)
+        print(
+            f"[openaire] {doi}: {len(projects)} project(s), "
+            f"{len(datasets)} dataset(s), {len(software_list)} software item(s)"
+        )
+        return result
+
+    except Exception as exc:
+        print(f"[openaire] funding lookup skipped for {doi}: {type(exc).__name__}: {exc}")
+        return None
+
+
+def _merge_openaire_fields(
+    result: dict[str, Any], oa_data: dict[str, Any]
+) -> dict[str, Any]:
+    """Add OpenAIRE funding/linked-entity fields to result.
+
+    Rules:
+    - Never overrides any existing canonical_paper field.
+    - Always sets funding_projects, linked_datasets, linked_software (empty lists
+      when no data — never null, never omitted).
+    - Adds openaire_id only when the paper doesn't already have one.
+    """
+    result = dict(result)
+    prov: dict[str, str] = dict(result.get("provenance") or {})
+
+    if not result.get("openaire_id") and oa_data.get("openaire_id"):
+        result["openaire_id"] = oa_data["openaire_id"]
+        prov["openaire_id"] = "openaire"
+
+    projects = oa_data.get("projects") or []
+    result["funding_projects"] = [
+        {
+            "name": p.get("name"),
+            "acronym": p.get("acronym"),
+            "funder": (p.get("funder") or {}).get("name"),
+            "funder_id": (p.get("funder") or {}).get("id"),
+            "start_date": p.get("startDate"),
+            "end_date": p.get("endDate"),
+            "url": p.get("websiteUrl"),
+        }
+        for p in projects
+    ]
+    prov["funding_projects"] = "openaire"
+
+    result["linked_datasets"] = [
+        {"title": d.get("title"), "url": d.get("url"), "doi": d.get("doi")}
+        for d in (oa_data.get("datasets") or [])
+    ]
+    prov["linked_datasets"] = "openaire"
+
+    result["linked_software"] = [
+        {"title": s.get("title"), "url": s.get("url")}
+        for s in (oa_data.get("software") or [])
+    ]
+    prov["linked_software"] = "openaire"
+
+    result["provenance"] = prov
+    return result
+
+
+async def _fetch_openaire_urls(doi: str) -> list[str]:
+    """Return alternate full-text URLs from OpenAIRE for the given DOI.  Empty on any error."""
+    _PRIORITY_DOMAINS = (
+        "jultika.oulu.fi", "pmc.ncbi.nlm.nih.gov", "ncbi.nlm.nih.gov/pmc",
+        "zenodo.org", "arxiv.org/pdf", "europepmc.org",
+        "core.ac.uk/download", "hdl.handle.net",
+    )
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.get(
+                "https://api.openaire.eu/search/publications",
+                params={"doi": doi, "format": "json", "size": "5"},
+                headers={"User-Agent": "AIRA-Scholar/1.0 (academic research tool)"},
+            )
+        if resp.status_code != 200:
+            return []
+        all_urls: list[str] = []
+        _collect_urls_recursive(resp.json(), all_urls)
+        priority = [u for u in all_urls if any(d in u for d in _PRIORITY_DOMAINS)]
+        rest = [u for u in all_urls if u not in set(priority)]
+        result = (priority + rest)[:8]
+        if result:
+            print(f"[fulltext] OpenAIRE found {len(result)} URL(s) for {doi}")
+        return result
+    except Exception as exc:
+        print(f"[fulltext] OpenAIRE lookup skipped for {doi}: {type(exc).__name__}")
+        return []
+
+
+def _ft_result(
+    work_id: str, status: str, text: str, source_url: str | None, tried: int
+) -> dict[str, Any]:
+    return {
+        "work_id": work_id,
+        "source_url": source_url,
+        "text": text,
+        "text_length": len(text) if status == "ok" else 0,
+        "status": status,
+        "candidates_tried": tried,
+    }
+
+
 @app.get("/paper/openalex/{work_id}")
 async def get_paper_insight(work_id: str):
     """Return enriched paper metadata and references from OpenAlex."""
+    # Cache-first: serve from SQLite if the record is fresh
+    cached = db.get_cached_paper(work_id)
+    if cached is not None:
+        # Always overlay OpenAIRE enrichment from the link tables — they are the
+        # ground truth and may have been populated by a later enrichment phase
+        # (e.g. Phase 7 Scholexplorer) after the paper JSON was cached.
+        cached = {**cached, **db.get_openaire_enrichment(work_id)}
+        return cached
+
     api_key = os.getenv("OPENALEX_API_KEY")
     base_params: dict[str, Any] = {}
     if api_key:
@@ -573,7 +1500,7 @@ async def get_paper_insight(work_id: str):
         print(f"Citing works fetch skipped for {work_id}: {type(exc).__name__}")
         # citing_works stays empty — graceful degradation
 
-    return {
+    result = {
         "id": work_id,
         "title": work.get("title") or "Untitled",
         "publication_year": paper_year,
@@ -595,24 +1522,291 @@ async def get_paper_insight(work_id: str):
         "referenced_works_count": len(work.get("referenced_works") or []),
         "referenced_works": referenced_works,
         "citing_works": citing_works,
+        "provenance": {f: "openalex" for f in (
+            "title", "abstract", "publication_year", "publication_date", "type",
+            "language", "cited_by_count", "doi", "venue", "is_oa", "oa_status",
+            "oa_url", "pdf_url", "authors", "topics", "referenced_works", "citing_works",
+        )},
     }
+
+    # Secondary enrichment: Crossref + Semantic Scholar
+    raw_doi = result.get("doi") or ""
+    doi_for_enrich = raw_doi.replace("https://doi.org/", "").replace("http://doi.org/", "").strip()
+    if doi_for_enrich:
+        # Crossref metadata enrichment
+        try:
+            cr_msg = await _fetch_crossref_metadata(doi_for_enrich)
+            if cr_msg is not None:
+                result = _merge_crossref_fields(result, _extract_crossref_fields(cr_msg))
+        except Exception as exc:
+            print(f"[crossref] enrichment skipped for {work_id}: {type(exc).__name__}: {exc}")
+
+        # Semantic Scholar citation cross-check
+        try:
+            ss_data = await _fetch_semantic_scholar_metadata(doi_for_enrich)
+            if ss_data is not None:
+                ss_fields = _extract_semantic_scholar_fields(ss_data)
+                related = None
+                if ss_fields.get("paper_id"):
+                    related = await _fetch_semantic_scholar_recommendations(ss_fields["paper_id"])
+                result = _merge_semantic_scholar_fields(result, ss_fields, related)
+        except Exception as exc:
+            print(f"[s2] enrichment skipped for {work_id}: {type(exc).__name__}: {exc}")
+
+    # arXiv preprint matching — check OpenAlex locations first, then API fallback
+    try:
+        oa_arxiv = _extract_arxiv_from_openalex(work)
+        if oa_arxiv is not None:
+            print(f"[arxiv] OpenAlex-linked preprint for {work_id}: {oa_arxiv['arxiv_id']}")
+            result = _merge_arxiv_fields(result, oa_arxiv)
+        else:
+            arxiv_data = await _fetch_arxiv_preprint(
+                doi_for_enrich or None,
+                result.get("title"),
+            )
+            result = _merge_arxiv_fields(result, arxiv_data)
+    except Exception as exc:
+        print(f"[arxiv] enrichment skipped for {work_id}: {type(exc).__name__}: {exc}")
+
+    # OpenAIRE funding / linked-entity enrichment (Phase 6)
+    # Always adds funding_projects, linked_datasets, linked_software (empty lists when
+    # no DOI or no OpenAIRE record) — never modifies any existing canonical_paper field.
+    oa_funding: dict[str, Any] = {}
+    if doi_for_enrich:
+        try:
+            fetched = await _fetch_openaire_funding(doi_for_enrich)
+            if fetched is not None:
+                oa_funding = fetched
+        except Exception as exc:
+            print(f"[openaire] enrichment skipped for {work_id}: {type(exc).__name__}: {exc}")
+
+    result = _merge_openaire_fields(result, oa_funding)
+
+    # Scholexplorer dataset/software linkage (Phase 7)
+    # Queries OpenAIRE Scholexplorer v2 for linked datasets/software and overrides the
+    # (always-empty) lists that _merge_openaire_fields set from the Graph API.
+    schol_data: dict[str, Any] = {}
+    if doi_for_enrich:
+        try:
+            fetched_schol = await _fetch_scholexplorer_datasets(doi_for_enrich)
+            if fetched_schol is not None:
+                schol_data = fetched_schol
+        except Exception as exc:
+            print(f"[scholexplorer] enrichment skipped for {work_id}: {type(exc).__name__}: {exc}")
+
+    if schol_data:
+        prov = dict(result.get("provenance") or {})
+        result["linked_datasets"] = [
+            {"title": d.get("title"), "url": d.get("url"), "doi": d.get("doi")}
+            for d in schol_data.get("datasets") or []
+        ]
+        prov["linked_datasets"] = "openaire_scholexplorer"
+        result["linked_software"] = [
+            {"title": s.get("title"), "url": s.get("url")}
+            for s in schol_data.get("software") or []
+        ]
+        prov["linked_software"] = "openaire_scholexplorer"
+        result["provenance"] = prov
+
+    if doi_for_enrich:
+        db.save_openaire_enrichment(
+            openalex_id=work_id,
+            projects=oa_funding.get("projects") or [],
+            datasets=schol_data.get("datasets") or [],
+            software=schol_data.get("software") or [],
+        )
+
+    db.save_paper(work_id, result, raw_openalex=work)
+    return result
+
+
+@app.get("/enrich/crossref/{doi:path}")
+async def enrich_crossref(doi: str):
+    """Return raw Crossref-extracted fields for a DOI (manual testing endpoint)."""
+    doi_clean = doi.replace("https://doi.org/", "").replace("http://doi.org/", "").strip()
+    msg = await _fetch_crossref_metadata(doi_clean)
+    if msg is None:
+        raise HTTPException(status_code=404, detail=f"Crossref has no record for DOI: {doi_clean}")
+    return {
+        "doi": doi_clean,
+        "source": "crossref",
+        "fields": _extract_crossref_fields(msg),
+    }
+
+
+@app.get("/enrich/arxiv/{doi:path}")
+async def enrich_arxiv(doi: str):
+    """Return arXiv preprint match data for a DOI (manual testing endpoint)."""
+    doi_clean = doi.replace("https://doi.org/", "").replace("http://doi.org/", "").strip()
+    data = await _fetch_arxiv_preprint(doi_clean, title=None)
+    return {"doi": doi_clean, "source": "arxiv", "match": data}
+
+
+@app.get("/enrich/semantic-scholar/{doi:path}")
+async def enrich_semantic_scholar(doi: str):
+    """Return raw Semantic Scholar-extracted fields for a DOI (manual testing endpoint)."""
+    doi_clean = doi.replace("https://doi.org/", "").replace("http://doi.org/", "").strip()
+    api_key = os.getenv("SEMANTIC_SCHOLAR_API_KEY")
+    data = await _fetch_semantic_scholar_metadata(doi_clean)
+    if data is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Semantic Scholar has no record for DOI: {doi_clean}",
+        )
+    ss_fields = _extract_semantic_scholar_fields(data)
+    related = None
+    if ss_fields.get("paper_id"):
+        related = await _fetch_semantic_scholar_recommendations(ss_fields["paper_id"])
+    return {
+        "doi": doi_clean,
+        "source": "semantic_scholar",
+        "api_key_used": bool(api_key),
+        "fields": ss_fields,
+        "semantic_scholar_related": related,
+    }
+
+
+@app.get("/enrich/openaire/{doi:path}")
+async def enrich_openaire(doi: str):
+    """Return raw OpenAIRE-extracted projects/funders/datasets/software for a DOI.
+
+    Uses Graph API v2.  Responses are cached in source_raw_cache with key
+    "openaire_funding"/doi — a second identical request will be served from cache
+    (visible in the server log as no new [openaire] fetch line).
+    """
+    doi_clean = doi.replace("https://doi.org/", "").replace("http://doi.org/", "").strip()
+    if not doi_clean:
+        raise HTTPException(status_code=400, detail="DOI must not be empty")
+
+    data = await _fetch_openaire_funding(doi_clean)
+    if data is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"OpenAIRE has no funding record for DOI: {doi_clean}",
+        )
+    return {
+        "doi": doi_clean,
+        "source": "openaire",
+        "openaire_id": data.get("openaire_id"),
+        "funding_projects": [
+            {
+                "name": p.get("name"),
+                "acronym": p.get("acronym"),
+                "funder": (p.get("funder") or {}).get("name"),
+                "funder_id": (p.get("funder") or {}).get("id"),
+                "start_date": p.get("startDate"),
+                "end_date": p.get("endDate"),
+                "url": p.get("websiteUrl"),
+            }
+            for p in (data.get("projects") or [])
+        ],
+        "linked_datasets": [
+            {"title": d.get("title"), "url": d.get("url"), "doi": d.get("doi")}
+            for d in (data.get("datasets") or [])
+        ],
+        "linked_software": [
+            {"title": s.get("title"), "url": s.get("url")}
+            for s in (data.get("software") or [])
+        ],
+    }
+
+
+@app.get("/enrich/openaire-datasets/{doi:path}")
+async def enrich_openaire_datasets(doi: str):
+    """Return linked datasets/software from OpenAIRE Scholexplorer v2 for a DOI.
+
+    Responses are cached under "openaire_scholexplorer"/doi.  A second identical
+    request within the TTL window is served from cache (check server logs for the
+    [scholexplorer] line to distinguish live fetch vs cache hit).
+    """
+    doi_clean = doi.replace("https://doi.org/", "").replace("http://doi.org/", "").strip()
+    if not doi_clean:
+        raise HTTPException(status_code=400, detail="DOI must not be empty")
+
+    data = await _fetch_scholexplorer_datasets(doi_clean)
+    if data is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Scholexplorer has no linked datasets/software for DOI: {doi_clean}",
+        )
+    return {
+        "doi": doi_clean,
+        "source": "openaire_scholexplorer",
+        "linked_datasets": [
+            {"title": d.get("title"), "url": d.get("url"), "doi": d.get("doi")}
+            for d in (data.get("datasets") or [])
+        ],
+        "linked_software": [
+            {"title": s.get("title"), "url": s.get("url")}
+            for s in (data.get("software") or [])
+        ],
+    }
+
+
+@app.get("/debug/db")
+def debug_db():
+    """Return SQLite cache status and record counts (no secrets exposed)."""
+    return db.db_status()
+
+
+@app.get("/debug/cache/{entity_type}/{entity_id}")
+def debug_cache(entity_type: str, entity_id: str):
+    """Return the raw canonical row for a cached paper or author.
+
+    entity_type : 'paper' | 'author'
+    entity_id   : OpenAlex ID, e.g. W2963403868 or A5023888391
+
+    The response includes field_provenance and last_refreshed_at so you can
+    verify which source supplied which field and when the record was last fetched.
+    The full cached_json blob is replaced by its character count.
+    """
+    if entity_type == "paper":
+        record = db.get_debug_paper(entity_id)
+    elif entity_type == "author":
+        record = db.get_debug_author(entity_id)
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown entity_type '{entity_type}'. Use 'paper' or 'author'.",
+        )
+
+    if record is None:
+        status = db.db_status()
+        if status.get("status") != "ok":
+            raise HTTPException(status_code=503, detail=f"DB unavailable: {status}")
+        raise HTTPException(
+            status_code=404,
+            detail=f"No cached record found for {entity_type}/{entity_id}",
+        )
+
+    return record
 
 
 @app.get("/paper/openalex/{work_id}/fulltext")
 async def get_paper_fulltext(work_id: str):
-    """Download an OA PDF and return extracted plain text (max 30 000 chars)."""
-    # Serve from cache if already fetched this session
-    if work_id in _pdf_cache:
-        text = _pdf_cache[work_id]
-        return {
-            "work_id": work_id,
-            "source_url": "(cached)",
-            "text": text,
-            "text_length": len(text),
-            "status": "ok",
-        }
+    """Try multiple OA sources for a paper's full text; fail with a specific message."""
 
-    # Re-fetch the work record to find the PDF URL
+    # 1. In-memory session cache
+    if work_id in _pdf_cache:
+        return _pdf_cache[work_id]
+
+    # 2. DB persistent cache
+    db_cached = db.get_cached_fulltext(work_id)
+    if db_cached is not None:
+        _pdf_cache[work_id] = db_cached
+        return db_cached
+
+    # 3. Check PyMuPDF is installed before any network call
+    try:
+        import fitz  # type: ignore[import]  # PyMuPDF
+    except ImportError:
+        return _ft_result(
+            work_id, "missing_dependency",
+            "PyMuPDF is not installed. Run: pip install pymupdf",
+            None, 0,
+        )
+
+    # 4. Fetch the OpenAlex work record
     api_key = os.getenv("OPENALEX_API_KEY")
     params: dict[str, Any] = {"api_key": api_key} if api_key else {}
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -620,99 +1814,106 @@ async def get_paper_fulltext(work_id: str):
             f"https://api.openalex.org/works/{work_id}", params=params
         )
         if oa_resp.status_code != 200:
-            return {
-                "work_id": work_id,
-                "source_url": None,
-                "text": "OpenAlex lookup failed. Cannot retrieve PDF.",
-                "text_length": 0,
-                "status": "error",
-            }
+            return _ft_result(
+                work_id, "error",
+                "OpenAlex lookup failed. Cannot retrieve PDF.",
+                None, 0,
+            )
         work = oa_resp.json()
 
-    pdf_url = _best_pdf_url(work)
-    if not pdf_url:
-        return {
-            "work_id": work_id,
-            "source_url": None,
-            "text": "No open-access PDF was found for this paper.",
-            "text_length": 0,
-            "status": "no_pdf",
-        }
+    # 5. Build ordered candidate list
+    candidates: list[str] = _collect_oa_pdf_candidates(work)
 
-    # Download the PDF
-    try:
-        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
-            pdf_resp = await client.get(
-                pdf_url,
-                headers={"User-Agent": "AIRA-Scholar/1.0 (academic research tool)"},
-            )
+    doi_raw: str = work.get("doi") or ""
+    doi_clean = doi_raw.replace("https://doi.org/", "").replace("http://doi.org/", "").strip()
+    if doi_clean:
+        crossref_urls, openaire_urls = await asyncio.gather(
+            _fetch_crossref_tdm_urls(doi_clean),
+            _fetch_openaire_urls(doi_clean),
+        )
+        for u in crossref_urls + openaire_urls:
+            if u not in candidates:
+                candidates.append(u)
+
+    print(f"[fulltext] {work_id}: {len(candidates)} candidate(s) to try")
+
+    if not candidates:
+        result = _ft_result(
+            work_id, "no_readable_source",
+            "No open-access sources found for this paper.",
+            None, 0,
+        )
+        db.save_fulltext(work_id, result)
+        return result
+
+    # 6. Try each candidate in order
+    last_status = "no_readable_source"
+    tried = 0
+
+    for i, url in enumerate(candidates):
+        print(f"[fulltext] {work_id} [{i+1}/{len(candidates)}] {url[:80]}")
+        tried += 1
+
+        try:
+            async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+                pdf_resp = await client.get(
+                    url,
+                    headers={"User-Agent": "AIRA-Scholar/1.0 (academic research tool)"},
+                )
+        except Exception as exc:
+            print(f"[fulltext]   [{i+1}] network error: {type(exc).__name__}")
+            continue
+
         if pdf_resp.status_code != 200:
-            return {
-                "work_id": work_id,
-                "source_url": pdf_url,
-                "text": f"PDF download failed (HTTP {pdf_resp.status_code}).",
-                "text_length": 0,
-                "status": "download_error",
-            }
-        pdf_bytes = pdf_resp.content
-    except Exception as exc:
-        print(f"PDF download error for {work_id}: {type(exc).__name__}: {exc}")
-        return {
-            "work_id": work_id,
-            "source_url": pdf_url,
-            "text": "Open-access PDF found, but could not be downloaded.",
-            "text_length": 0,
-            "status": "download_error",
-        }
+            print(f"[fulltext]   [{i+1}] HTTP {pdf_resp.status_code}")
+            continue
 
-    # Extract text with PyMuPDF
-    try:
-        import fitz  # type: ignore[import]  # PyMuPDF
-    except ImportError:
-        return {
-            "work_id": work_id,
-            "source_url": pdf_url,
-            "text": "PDF found but PyMuPDF is not installed. Run: pip install pymupdf",
-            "text_length": 0,
-            "status": "missing_dependency",
-        }
+        # Skip HTML landing pages without feeding them to the PDF parser
+        ct = (pdf_resp.headers.get("content-type") or "").lower()
+        if "pdf" not in ct:
+            print(f"[fulltext]   [{i+1}] skipped (content-type={ct!r})")
+            continue
 
-    try:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        page_texts = [page.get_text() for page in doc]
-        doc.close()
-        raw = "\n".join(page_texts)
-        full_text = "\n".join(line for line in raw.splitlines() if line.strip())
-    except Exception as exc:
-        print(f"PDF extraction error for {work_id}: {type(exc).__name__}: {exc}")
-        return {
-            "work_id": work_id,
-            "source_url": pdf_url,
-            "text": "Open-access PDF found, but text extraction failed.",
-            "text_length": 0,
-            "status": "extraction_error",
-        }
+        try:
+            doc = fitz.open(stream=pdf_resp.content, filetype="pdf")
+            page_texts = [page.get_text() for page in doc]
+            doc.close()
+            raw = "\n".join(page_texts)
+            full_text = "\n".join(line for line in raw.splitlines() if line.strip())
+        except Exception as exc:
+            print(f"[fulltext]   [{i+1}] extraction error: {type(exc).__name__}")
+            last_status = "unreadable_pdf"
+            continue
 
-    if len(full_text.strip()) < 100:
-        return {
-            "work_id": work_id,
-            "source_url": pdf_url,
-            "text": "Open-access PDF found, but text extraction failed.",
-            "text_length": 0,
-            "status": "extraction_error",
-        }
+        if len(full_text.strip()) < 100:
+            print(f"[fulltext]   [{i+1}] too little text — likely scanned/image PDF")
+            last_status = "unreadable_pdf"
+            continue
 
-    if len(full_text) > 30_000:
-        full_text = full_text[:30_000]
+        if len(full_text) > 30_000:
+            full_text = full_text[:30_000]
+        print(f"[fulltext]   [{i+1}] SUCCESS: {len(full_text):,} chars from {url[:60]}")
+        result = _ft_result(work_id, "ok", full_text, url, tried)
+        _pdf_cache[work_id] = result
+        db.save_fulltext(work_id, result)
+        return result
 
-    _pdf_cache[work_id] = full_text
-    return {
-        "work_id": work_id,
-        "source_url": pdf_url,
-        "text": full_text,
-        "text_length": len(full_text),
-        "status": "ok",
-    }
+    # 7. All candidates exhausted
+    if last_status == "unreadable_pdf":
+        msg = (
+            "A PDF was found but couldn't be read as text "
+            "(it may be a scanned or image-only document)."
+        )
+    else:
+        noun = "source" if tried == 1 else "sources"
+        msg = (
+            f"Full text isn't accessible for automated reading "
+            f"(tried {tried} {noun}). "
+            "You can still read it directly using the Open Access PDF link above."
+        )
+    result = _ft_result(work_id, last_status, msg, None, tried)
+    db.save_fulltext(work_id, result)
+    return result
 
 
 # ── AIRA Assistant chat ──────────────────────────────────────────────────────
@@ -1166,8 +2367,8 @@ async def _call_ollama(
         "stream": False,
         "options": {
             "temperature": 0.1,
-            "num_predict": 350,
-            "num_ctx": 4096,
+            "num_predict": 512,
+            "num_ctx": 8192,
         },
     }
     try:
@@ -1189,10 +2390,19 @@ async def _call_ollama(
         return f"Ollama returned an unexpected error (HTTP {status}). Please try again."
 
     try:
-        return str(resp.json()["message"]["content"])
+        content = str(resp.json()["message"]["content"])
     except Exception as exc:
         print(f"AIRA Assistant error: could not parse Ollama response — {type(exc).__name__}")
         return "Received an unexpected response format from Ollama. Please try again."
+
+    if not content.strip():
+        print(f"AIRA Assistant warning: Ollama returned empty content for model={_OLLAMA_MODEL}")
+        return (
+            "The model returned an empty response. "
+            "This can happen when the context is too large or the model is confused. "
+            "Try a more specific question."
+        )
+    return content
 
 
 async def _call_gemini(
@@ -1473,3 +2683,119 @@ async def chat(req: ChatRequest):
         }
 
     return {"answer": answer, "sources_used": sources_used}
+
+
+# ── Semantic Search ───────────────────────────────────────────────────────────
+
+_qdrant_client: Any = None
+_embed_model: Any = None
+_QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION") or "oulucris_publications"
+
+
+def _get_qdrant_client() -> Any:
+    global _qdrant_client
+    if _qdrant_client is None:
+        from qdrant_client import QdrantClient  # type: ignore[import]
+        host = os.getenv("QDRANT_HOST", "localhost")
+        port = int(os.getenv("QDRANT_PORT", "6333"))
+        api_key = os.getenv("QDRANT_API_KEY") or None
+        use_https = os.getenv("QDRANT_HTTPS", "false").lower() in ("1", "true", "yes")
+        _qdrant_client = QdrantClient(host=host, port=port, api_key=api_key, https=use_https)
+    return _qdrant_client
+
+
+def _get_embed_model() -> Any:
+    global _embed_model
+    if _embed_model is None:
+        from sentence_transformers import SentenceTransformer  # type: ignore[import]
+        print("[semantic] loading all-mpnet-base-v2 model…")
+        _embed_model = SentenceTransformer("all-mpnet-base-v2")
+        print("[semantic] model ready")
+    return _embed_model
+
+
+def _oa_full_to_short(full_url: str) -> str:
+    return full_url.removeprefix("https://openalex.org/")
+
+
+async def _run_semantic_search(query: str, limit: int) -> list[dict[str, Any]]:
+    loop = asyncio.get_event_loop()
+
+    model = await loop.run_in_executor(None, _get_embed_model)
+    vector: list[float] = await loop.run_in_executor(
+        None, lambda: model.encode(query, normalize_embeddings=True).tolist()
+    )
+
+    client = _get_qdrant_client()
+    response = await loop.run_in_executor(
+        None,
+        lambda: client.query_points(
+            collection_name=_QDRANT_COLLECTION,
+            query=vector,
+            using="abstract_embedding",
+            limit=limit,
+            with_payload=True,
+        ),
+    )
+
+    results: list[dict[str, Any]] = []
+    for hit in response.points:
+        payload = hit.payload or {}
+        full_oa_id: str = payload.get("openalex_id") or ""
+        short_id = _oa_full_to_short(full_oa_id)
+        local_paper = db.get_cached_paper(short_id) is not None
+
+        authors_raw = payload.get("authors") or []
+        author_names: list[str] = []
+        for a in authors_raw[:5]:
+            if isinstance(a, dict):
+                name = (
+                    a.get("display_name")
+                    or (a.get("author") or {}).get("display_name")
+                    or ""
+                )
+            else:
+                name = str(a)
+            if name:
+                author_names.append(name)
+
+        results.append({
+            "id": short_id,
+            "openalex_id": full_oa_id,
+            "title": payload.get("title"),
+            "authors": author_names,
+            "year": payload.get("year"),
+            "venue": payload.get("venue"),
+            "score": round(float(hit.score), 4),
+            "is_oa": bool(payload.get("is_open_access")),
+            "local_paper_available": local_paper,
+        })
+    return results
+
+
+_SEMANTIC_MAX = 200
+
+
+@app.get("/search/semantic")
+async def semantic_search_endpoint(q: str, limit: int = 10):
+    """Search Oulucris publications by semantic similarity to the query."""
+    if not q.strip():
+        raise HTTPException(status_code=400, detail="Query 'q' must not be empty")
+    requested_limit = max(1, limit)
+    actual_limit = min(requested_limit, _SEMANTIC_MAX)
+    limit_reason = "exact_match" if requested_limit <= _SEMANTIC_MAX else "capped_at_max"
+    try:
+        results = await _run_semantic_search(q, actual_limit)
+    except Exception as exc:
+        print(f"[semantic_search] {type(exc).__name__}: {exc}")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Semantic search unavailable: {type(exc).__name__}",
+        )
+    return {
+        "query": q,
+        "requested_limit": requested_limit,
+        "actual_count": len(results),
+        "limit_reason": limit_reason,
+        "results": results,
+    }
