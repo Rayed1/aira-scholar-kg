@@ -152,6 +152,7 @@ CREATE TABLE IF NOT EXISTS project_funder_link (
     funder_id  INTEGER NOT NULL,
     PRIMARY KEY (project_id, funder_id)
 );
+
 """
 
 
@@ -820,3 +821,4 @@ def get_openaire_enrichment(openalex_id: str) -> dict[str, Any]:
             f"[DB] read error (openaire/{openalex_id}): {type(exc).__name__}: {exc}"
         )
         return empty
+
