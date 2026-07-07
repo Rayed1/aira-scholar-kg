@@ -217,6 +217,7 @@ async def get_oulu_openalex_graph(
         nodes[paper_id] = {
             "id": paper_id,
             "label": title[:70],
+            "title": title,
             "type": "Paper",
             "year": year,
             "citations": citations,
@@ -346,6 +347,7 @@ async def get_oulu_openalex_graph(
                 nodes[ref_id] = {
                     "id": ref_id,
                     "label": ref_title[:70],
+                    "title": ref_title,
                     "type": "ReferencedPaper",
                     "year": ref_year,
                     "citations": ref_citations,
@@ -1958,7 +1960,7 @@ RULES:
 _OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").strip().rstrip("/")
 _OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2").strip()
 _GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-lite").strip()
-_OPENAI_MODEL = "gpt-4o-mini"
+_OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o").strip()
 
 
 def _ollama_is_running() -> bool:

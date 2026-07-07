@@ -4,11 +4,14 @@ import ForceGraph3D from "react-force-graph-3d";
 import { forceCollide } from "d3-force";
 import "./App.css";
 
+const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
+
 // ── Graph types ─────────────────────────────────────────────────────────────
 
 type NodeInfo = {
   id: string;
   label: string;
+  title?: string;
   type: "Paper" | "Author" | "Topic" | "ReferencedPaper";
   details: string;
   year?: number;
@@ -457,7 +460,7 @@ function App() {
         to_year: toYear,
       });
       const response = await fetch(
-        `http://127.0.0.1:8000/graph/openalex/oulu?${params.toString()}`
+        `${API_BASE}/graph/openalex/oulu?${params.toString()}`
       );
       if (!response.ok) throw new Error("Failed to fetch graph data");
       const backendGraph: GraphResponse = await response.json();
@@ -520,7 +523,7 @@ function App() {
     setAuthorInsightError(null);
     setAuthorInsight(null);
 
-    fetch(`http://127.0.0.1:8000/author/openalex/${nodeId}`)
+    fetch(`${API_BASE}/author/openalex/${nodeId}`)
       .then((res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return res.json() as Promise<AuthorInsight>;
@@ -555,7 +558,7 @@ function App() {
     setPaperInsightError(null);
     setPaperInsight(null);
 
-    fetch(`http://127.0.0.1:8000/paper/openalex/${nodeId}`)
+    fetch(`${API_BASE}/paper/openalex/${nodeId}`)
       .then((res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return res.json() as Promise<PaperInsight>;
@@ -591,7 +594,7 @@ function App() {
     setSemanticResults([]);
     setSemanticCapInfo(null);
     const requested = Math.max(parseInt(resultLimit) || 10, 1);
-    fetch(`http://127.0.0.1:8000/search/semantic?q=${encodeURIComponent(searchTerm)}&limit=${requested}`)
+    fetch(`${API_BASE}/search/semantic?q=${encodeURIComponent(searchTerm)}&limit=${requested}`)
       .then((res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return res.json() as Promise<{
@@ -633,7 +636,7 @@ function App() {
   const loadFullText = (workId: string) => {
     setFullTextLoading(true);
     setFullTextStatus(null);
-    fetch(`http://127.0.0.1:8000/paper/openalex/${workId}/fulltext`)
+    fetch(`${API_BASE}/paper/openalex/${workId}/fulltext`)
       .then((res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return res.json() as Promise<FullTextResult>;
@@ -758,9 +761,10 @@ function App() {
   // ── Review List ────────────────────────────────────────────
 
   const addToReviewList = (paper: PaperInsight) => {
-    setReviewList((prev) =>
-      prev.some((p) => p.id === paper.id) ? prev : [...prev, paper]
-    );
+    setReviewList((prev) => {
+      if (prev.some((p) => p.id === paper.id)) return prev;
+      return [...prev, paper];
+    });
   };
 
   const removeFromReviewList = (id: string) => {
@@ -886,7 +890,7 @@ function App() {
           label: l.label,
         })),
       };
-      const res = await fetch("http://127.0.0.1:8000/chat", {
+      const res = await fetch(`${API_BASE}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
@@ -1240,7 +1244,7 @@ function App() {
               <span>
                 {isFocusMode
                   ? `Focus · ${displayGraphData.nodes.length} nodes`
-                  : "OpenAlex metadata · University of Oulu"}
+                  : "University of Oulu"}
               </span>
             </div>
 
@@ -1418,7 +1422,7 @@ function App() {
                   {selectedNode.type}
                 </span>
 
-                <h3 className="node-label">{selectedNode.label}</h3>
+                <h3 className="node-label">{selectedNode.title ?? selectedNode.label}</h3>
 
                 {/* Standard metadata rows — hidden when all fields are absent */}
                 {hasNodeMeta && (
