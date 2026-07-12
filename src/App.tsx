@@ -3,8 +3,9 @@ import ForceGraph2D, { type ForceGraphMethods } from "react-force-graph-2d";
 import ForceGraph3D from "react-force-graph-3d";
 import { forceCollide } from "d3-force";
 import "./App.css";
+import logoUrl from "./assets/logo.png";
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
+const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "";
 
 // ── Graph types ─────────────────────────────────────────────────────────────
 
@@ -271,17 +272,16 @@ function App() {
 
   // ── Graph state ────────────────────────────────────────────
   const [selectedNode, setSelectedNode] = useState<NodeInfo | null>(null);
-  const [searchTerm, setSearchTerm] = useState("artificial intelligence");
+  const [searchTerm, setSearchTerm] = useState("");
   const [isLoading, setIsLoading] = useState(false);
-  const [fromYear, setFromYear] = useState("2020");
-  const [toYear, setToYear] = useState("2026");
-  const [resultLimit, setResultLimit] = useState("50");
+  const [fromYear, setFromYear] = useState("");
+  const [toYear, setToYear] = useState("");
+  const [resultLimit, setResultLimit] = useState("");
   const [graphView, setGraphView] = useState<"2D" | "3D">("2D");
   const [activeFilter, setActiveFilter] = useState<FilterType>("All");
-  const [statusMessage, setStatusMessage] = useState(
-    "Real OpenAlex Oulu metadata connected"
-  );
+  const [statusMessage, setStatusMessage] = useState("");
   const [nodeSearchTerm, setNodeSearchTerm] = useState("");
+  const [currentMatchIndex, setCurrentMatchIndex] = useState(-1);
   const [isFocusMode, setIsFocusMode] = useState(false);
   const [showIsolated, setShowIsolated] = useState(false);
 
@@ -318,6 +318,9 @@ function App() {
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
   const [isChatCollapsed, setIsChatCollapsed] = useState(true);
+
+  // ── Help modal state ────────────────────────────────────────
+  const [isHelpOpen, setIsHelpOpen] = useState(false);
 
   // ── Review List state ──────────────────────────────────
   const [reviewList, setReviewList] = useState<PaperInsight[]>([]);
@@ -427,13 +430,13 @@ function App() {
     return new Set(sorted.slice(0, 5).map((n) => n.id));
   }, [displayGraphData]);
 
-  const nodeSearchMatchCount = useMemo(() => {
+  const nodeSearchMatches = useMemo(() => {
     const q = nodeSearchTerm.trim().toLowerCase();
-    if (!q) return 0;
-    return visibleGraphData.nodes.filter((n) =>
+    if (!q) return [];
+    return stableGraphData.nodes.filter((n) =>
       n.label.toLowerCase().includes(q)
-    ).length;
-  }, [nodeSearchTerm, visibleGraphData]);
+    );
+  }, [nodeSearchTerm, stableGraphData]);
 
   // ── Data loading ───────────────────────────────────────────
 
@@ -589,6 +592,8 @@ function App() {
 
   const loadSemanticSearch = () => {
     if (!searchTerm.trim()) return;
+    setChatMessages([]);
+    setChatInput("");
     setSemanticLoading(true);
     setSemanticError(null);
     setSemanticResults([]);
@@ -672,11 +677,12 @@ function App() {
       }
     });
 
-    if (selectedNode && selectedNode.id !== node.id && chatMessages.length > 0) {
+    if (selectedNode && selectedNode.id !== node.id) {
       setChatMessages((prev) => [
         ...prev,
         { role: "system", content: `── Selected node changed: ${node.label} (${node.type}) ──` },
       ]);
+      setChatInput("");
     }
 
     setSelectedNode(node);
@@ -715,12 +721,12 @@ function App() {
   // ── Node search ────────────────────────────────────────────
 
   const findNode = () => {
-    const q = nodeSearchTerm.trim().toLowerCase();
-    if (!q) return;
-    const match = visibleGraphData.nodes.find((n) =>
-      n.label.toLowerCase().includes(q)
-    );
-    if (match) handleNodeClick(match);
+    if (nodeSearchMatches.length === 0) return;
+    const nextIndex = currentMatchIndex < 0
+      ? 0
+      : (currentMatchIndex + 1) % nodeSearchMatches.length;
+    handleNodeClick(nodeSearchMatches[nextIndex]);
+    setCurrentMatchIndex(nextIndex);
   };
 
   // ── Focus view ─────────────────────────────────────────────
@@ -931,6 +937,14 @@ function App() {
   // ── Effects ────────────────────────────────────────────────
 
   useEffect(() => {
+    if (!isHelpOpen) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setIsHelpOpen(false); };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [isHelpOpen]);
+
+  useEffect(() => {
+    if (!searchTerm.trim()) return;
     const id = window.setTimeout(() => void loadGraph(searchTerm), 0);
     return () => window.clearTimeout(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -994,9 +1008,9 @@ function App() {
       {/* ── Sidebar ── */}
       <aside className="sidebar">
         <div className="sidebar-brand">
-          <div className="brand-icon">KG</div>
+          <img src={logoUrl} alt="" className="brand-icon" />
           <div>
-            <h2>AIRA Scholar</h2>
+            <h2>AIRA Scholar-KG</h2>
             <p>Knowledge Graph Explorer</p>
           </div>
         </div>
@@ -1013,7 +1027,7 @@ function App() {
 
         <div className="sidebar-section">
           <h3 className="section-label">Status</h3>
-          <p className="status-msg">{statusMessage}</p>
+          {statusMessage && <p className="status-msg">{statusMessage}</p>}
           <p className="status-source">OpenAlex · University of Oulu</p>
         </div>
 
@@ -1066,10 +1080,16 @@ function App() {
         </div>
 
         <div className="sidebar-section">
-          <h3 className="section-label">Export</h3>
+          <h3 className="section-label">Observability</h3>
           <div className="filter-list">
-            <button className="export-btn" onClick={exportPng}>Export PNG</button>
-            <button className="export-btn" onClick={exportJson}>Export JSON</button>
+            <a
+              className="export-btn"
+              href="https://cloud.langfuse.com/project/cmrev396w0134ad0d4eset9mr/traces"
+              target="_blank"
+              rel="noreferrer"
+            >
+              Traces ↗
+            </a>
           </div>
         </div>
 
@@ -1125,7 +1145,20 @@ function App() {
       <section className="content">
         <header className="topbar">
           <div className="topbar-title">
-            <h1>Interactive Academic Knowledge Graph</h1>
+            <div className="topbar-title-row">
+              <h1>Interactive Academic Knowledge Graph</h1>
+              <button
+                className="help-icon-btn"
+                aria-label="How to use this"
+                onClick={() => setIsHelpOpen(true)}
+              >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <circle cx="12" cy="12" r="10" />
+                  <line x1="12" y1="16" x2="12" y2="12" />
+                  <circle cx="12" cy="8" r="0.5" fill="currentColor" stroke="none" />
+                </svg>
+              </button>
+            </div>
             <p>Search University of Oulu publications · visualize papers, authors, topics, and citations</p>
           </div>
 
@@ -1144,12 +1177,12 @@ function App() {
             />
             {searchMode === "keyword" && (
               <>
-                <input className="year-input" value={fromYear} onChange={(e) => setFromYear(e.target.value)} placeholder="From" />
+                <input className="year-input" value={fromYear} onChange={(e) => setFromYear(e.target.value)} placeholder="e.g. 2020" />
                 <span className="year-sep">–</span>
-                <input className="year-input" value={toYear} onChange={(e) => setToYear(e.target.value)} placeholder="To" />
+                <input className="year-input" value={toYear} onChange={(e) => setToYear(e.target.value)} placeholder="e.g. 2026" />
               </>
             )}
-            <input className="limit-input" value={resultLimit} onChange={(e) => setResultLimit(e.target.value)} placeholder="Limit" />
+            <input className="limit-input" value={resultLimit} onChange={(e) => setResultLimit(e.target.value)} placeholder="e.g. 50" />
             <button
               className="search-btn"
               onClick={() => { if (searchMode === "semantic") loadSemanticSearch(); else void loadGraph(searchTerm); }}
@@ -1167,6 +1200,19 @@ function App() {
                 <button className={`toggle-btn${graphView === "3D" ? " active" : ""}`} onClick={() => setGraphView("3D")}>3D</button>
               </div>
             )}
+            <div className="view-toggle">
+              <a
+                className="toggle-btn"
+                href="https://z0xy470n.forms.app/untitled-form"
+                target="_blank"
+                rel="noreferrer"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ display: "inline-block", verticalAlign: "middle", marginRight: 5, marginBottom: 1 }}>
+                  <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+                </svg>
+                Feedback
+              </a>
+            </div>
           </div>
         </header>
 
@@ -1248,17 +1294,33 @@ function App() {
               </span>
             </div>
 
+            {graphData.nodes.length === 0 && !isLoading && (
+              <div className="graph-onboarding">
+                <div className="graph-onboarding-msg">
+                  <p className="graph-onboarding-heading">Get started</p>
+                  <ul>
+                    <li>Type a topic, author, or paper title in the search bar</li>
+                    <li>Set a year range</li>
+                    <li>Choose how many papers to load, then click Search</li>
+                  </ul>
+                </div>
+              </div>
+            )}
+
             <div className="graph-search">
               <input
                 className="graph-search-input"
                 value={nodeSearchTerm}
-                onChange={(e) => setNodeSearchTerm(e.target.value)}
+                onChange={(e) => { setNodeSearchTerm(e.target.value); setCurrentMatchIndex(-1); }}
                 onKeyDown={(e) => { if (e.key === "Enter") findNode(); }}
                 placeholder="Find node…"
               />
               {nodeSearchTerm.trim() !== "" && (
                 <span className="graph-search-count">
-                  {nodeSearchMatchCount} match{nodeSearchMatchCount !== 1 ? "es" : ""}
+                  {currentMatchIndex >= 0 && nodeSearchMatches.length > 0
+                    ? `${currentMatchIndex + 1} of ${nodeSearchMatches.length} match${nodeSearchMatches.length !== 1 ? "es" : ""}`
+                    : `${nodeSearchMatches.length} match${nodeSearchMatches.length !== 1 ? "es" : ""}`
+                  }
                 </span>
               )}
               <button className="graph-ctrl-btn" onClick={findNode} disabled={nodeSearchTerm.trim() === ""} title="Find first matching node">
@@ -2031,7 +2093,7 @@ function App() {
       {!isChatCollapsed && (
         <div className="chat-popup">
           <div className="chat-popup-header">
-            <span className="chat-header-title">AIRA Assistant</span>
+            <span className="chat-header-title">AIRA Chat Assistant</span>
             <button
               className="chat-toggle-btn"
               aria-label="Close chat"
@@ -2093,8 +2155,73 @@ function App() {
         onClick={() => setIsChatCollapsed((c) => !c)}
         aria-label="Toggle AIRA Assistant"
       >
-        {isChatCollapsed ? "AIRA" : "↓"}
+        {isChatCollapsed ? "AIRA Chat Assistant" : "↓"}
       </button>
+
+      {/* ── Help / How to use modal ── */}
+      {isHelpOpen && (
+        <div
+          className="help-overlay"
+          onClick={() => setIsHelpOpen(false)}
+        >
+          <div
+            className="help-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="help-modal-title"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="help-modal-header">
+              <span id="help-modal-title" className="help-modal-title">How to use this</span>
+              <button
+                className="chat-toggle-btn"
+                aria-label="Close instructions"
+                onClick={() => setIsHelpOpen(false)}
+              >
+                ×
+              </button>
+            </div>
+            <div className="help-modal-body">
+              <h2>Welcome to AIRA Scholar KG</h2>
+              <p>An interactive knowledge graph for exploring research papers, authors, and topics. Search, click through connections, and ask questions about anything you find.</p>
+              <ol>
+                <li><div>
+                  <strong>Search</strong>
+                  Type a topic, author, or paper title into the search bar to build a graph around it. Results are pulled from multiple sources (OpenAlex, Crossref, Semantic Scholar, arXiv, OpenAIRE) and merged automatically. Switch between Keyword and Semantic search using the toggle next to the search button. Keyword search matches exact words. Semantic search finds papers that are conceptually related to your query, even when the wording is completely different, by comparing meaning rather than text.
+                </div></li>
+                <li><div>
+                  <strong>Explore the graph</strong>
+                  Drag nodes to rearrange them, scroll to zoom, and drag the background to pan. Papers, authors, and topics appear as different node types. Click any node to see its details. Lines between nodes show real connections such as citations, shared authorship, or shared topics.
+                </div></li>
+                <li><div>
+                  <strong>View details</strong>
+                  Click a node to open its detail panel: paper metadata, author info, or topic summary, depending on what you clicked.
+                </div></li>
+                <li><div>
+                  <strong>Load full text</strong>
+                  On a paper detail panel, click Load Full Text to pull in the complete document (available for a subset of papers). This unlocks deeper questions in the chat assistant, including specific results, numbers, and findings.
+                </div></li>
+                <li><div>
+                  <strong>Ask the AIRA Chat Assistant</strong>
+                  Click the chat icon to ask questions about the graph or a selected node. Try the suggested quick questions, or type your own. The chat resets automatically whenever you run a new search, so each search starts a fresh conversation. Selecting a different node keeps your conversation going, so you can compare notes across papers without losing context.
+                </div></li>
+                <li><div>
+                  <strong>Check why things are connected</strong>
+                  Use the Citation and Connection Explanation panel to see why two nodes are linked: shared authors, shared topics, or direct citations, based on real data.
+                </div></li>
+                <li><div>
+                  <strong>Save papers to your review list</strong>
+                  Click Add to Review List on any paper you want to come back to. Saved papers appear in the Review List section in the sidebar, so you can keep track of what you have found during your session without losing your place.
+                </div></li>
+                <li><div>
+                  <strong>Export your graph</strong>
+                  Save your current graph as an image (PNG) or a data file (JSON) to keep or share your work.
+                </div></li>
+              </ol>
+            </div>
+          </div>
+        </div>
+      )}
     </main>
   );
 }

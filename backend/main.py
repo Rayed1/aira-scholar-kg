@@ -3,13 +3,15 @@ import difflib
 import os
 import re
 import xml.etree.ElementTree as ET
-from typing import Any
+from typing import Any, TypedDict
 
 import db
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from langfuse import get_client, observe
+from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
 
 
@@ -31,6 +33,7 @@ def reconstruct_abstract(inverted_index: dict[str, list[int]] | None) -> str:
 
 
 load_dotenv()
+langfuse = get_client()
 
 app = FastAPI(
     title="AIRA Scholar-KG Backend",
@@ -44,6 +47,7 @@ app.add_middleware(
         "http://localhost:5173",
         "http://localhost:5174",
         "http://localhost:5175",
+        "http://86.50.20.161",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -2349,10 +2353,15 @@ def _try_direct_answer(req: ChatRequest) -> str | None:
     return None  # fall through to LLM
 
 
+@observe(as_type="generation", name="ollama-chat", capture_input=False)
 async def _call_ollama(
     base_url: str, context: str, question: str, history: list[dict[str, str]]
 ) -> str:
     """Call Ollama local API and return the answer text."""
+    langfuse.update_current_generation(
+        model=_OLLAMA_MODEL,
+        input={"context": context, "question": question, "history": history},
+    )
     messages: list[dict[str, str]] = [{"role": "system", "content": _SYSTEM_PROMPT}]
     for turn in history[-2:]:  # at most 2 prior user+assistant pairs
         role = turn.get("role", "")
@@ -2407,10 +2416,15 @@ async def _call_ollama(
     return content
 
 
+@observe(as_type="generation", name="gemini-chat", capture_input=False)
 async def _call_gemini(
     api_key: str, context: str, question: str, history: list[dict[str, str]]
 ) -> str:
     """Call Gemini REST API and return the answer text."""
+    langfuse.update_current_generation(
+        model=_GEMINI_MODEL,
+        input={"context": context, "question": question, "history": history},
+    )
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
         f"{_GEMINI_MODEL}:generateContent?key={api_key}"
@@ -2462,10 +2476,15 @@ async def _call_gemini(
         return "Received an unexpected response format from Gemini. Please try again."
 
 
+@observe(as_type="generation", name="openai-chat", capture_input=False)
 async def _call_openai(
     api_key: str, context: str, question: str, history: list[dict[str, str]]
 ) -> str:
     """Call OpenAI Chat Completions API and return the answer text."""
+    langfuse.update_current_generation(
+        model=_OPENAI_MODEL,
+        input={"context": context, "question": question, "history": history},
+    )
     messages: list[dict[str, str]] = [{"role": "system", "content": _SYSTEM_PROMPT}]
     for turn in history[-2:]:
         role = turn.get("role", "")
@@ -2537,12 +2556,14 @@ def _extract_numeric_sentences(full_text: str, max_sentences: int = 15) -> list[
     return candidates
 
 
+@observe(name="chat-numeric-handler", capture_input=False)
 async def _handle_numeric_result(req: ChatRequest, provider: str, credential: str) -> dict:
     """Dedicated handler for numeric-result questions.
 
     Extracts research-numeric sentences from full text before the LLM is called,
     so metadata values (citation count, year, references) can never leak in as results.
     """
+    langfuse.update_current_span(input={"question": req.question, "provider": provider})
     if not req.full_text:
         pi = req.paper_insight or {}
         sn = req.selected_node or {}
@@ -2633,12 +2654,50 @@ def chat_status():
 
 
 @app.post("/chat")
+@observe(name="chat-endpoint")
 async def chat(req: ChatRequest):
     """Answer a question about the current graph using the configured LLM provider."""
     provider, credential = _resolve_provider()
+    initial: _ChatGraphState = {
+        "req": req,
+        "provider": provider,
+        "credential": credential,
+        "route": "",
+        "context": "",
+        "focused_context": "",
+        "focused_question": "",
+        "sources_used": [],
+        "answer": "",
+    }
+    result = await _chat_graph.ainvoke(initial)
+    return {"answer": result["answer"], "sources_used": result["sources_used"]}
+
+
+# ── LangGraph chat workflow ────────────────────────────────────────────────────
+
+
+class _ChatGraphState(TypedDict):
+    req: ChatRequest
+    provider: str
+    credential: str
+    # "numeric" | "numeric_no_text" | "numeric_no_candidates"
+    # | "direct" | "general" | "no_provider" | ""
+    route: str
+    context: str
+    focused_context: str
+    focused_question: str
+    sources_used: list[str]
+    answer: str
+
+
+def _graph_route_question(state: _ChatGraphState) -> dict:
+    provider = state["provider"]
+    credential = state["credential"]
+    q = state["req"].question
 
     if provider == "none" or not credential:
         return {
+            "route": "no_provider",
             "answer": (
                 "AI assistant is not configured. "
                 "Start Ollama, or add GEMINI_API_KEY / OPENAI_API_KEY to backend/.env "
@@ -2647,35 +2706,106 @@ async def chat(req: ChatRequest):
             "sources_used": [],
         }
 
-    # Numeric-result questions: extract candidate sentences from full text BEFORE
-    # the LLM sees any context, so metadata (citations, year, references) can never
-    # be confused with research findings.
-    q = req.question
     if (
         bool(_KW_NUMERIC.search(q))
         and not bool(_KW_CITATION.search(q))
         and not bool(_KW_AUTHOR.search(q))
     ):
-        return await _handle_numeric_result(req, provider, credential)
+        return {"route": "numeric"}
 
+    return {"route": "pending"}
+
+
+def _graph_build_context(state: _ChatGraphState) -> dict:
+    route = state["route"]
+    req = state["req"]
+
+    if route == "numeric":
+        if not req.full_text:
+            pi = req.paper_insight or {}
+            sn = req.selected_node or {}
+            year = pi.get("publication_year") or sn.get("year")
+            cites = pi.get("cited_by_count") if pi else sn.get("citations")
+            meta_parts = []
+            if year:
+                meta_parts.append(f"year={year}")
+            if cites is not None:
+                meta_parts.append(f"citations={cites}")
+            meta_note = f" (available metadata: {', '.join(meta_parts)})" if meta_parts else ""
+            return {
+                "route": "numeric_no_text",
+                "answer": (
+                    "Full text has not been loaded for this paper. "
+                    "I cannot report research findings without it. "
+                    f"Click 'Load Full Text' if available.{meta_note} (source: metadata only)"
+                ),
+                "sources_used": [],
+            }
+
+        candidates = _extract_numeric_sentences(req.full_text, max_sentences=15)
+        if not candidates:
+            return {
+                "route": "numeric_no_candidates",
+                "answer": (
+                    "The loaded full text does not clearly show specific numerical research results. "
+                    "Results may be in tables, figures, or appendices not captured in the extracted text. "
+                    "(source: full text)"
+                ),
+                "sources_used": ["full_text"],
+            }
+
+        candidate_block = "\n".join(f"• {s}" for s in candidates)
+        focused_context = (
+            "CANDIDATE RESULT SENTENCES extracted from the full paper text:\n\n"
+            f"{candidate_block}"
+        )
+        focused_question = (
+            f"{req.question}\n\n"
+            "Based ONLY on the candidate sentences above, summarize the numerical research "
+            "results. Do NOT use citation count, year, reference count, or any publication "
+            "metadata. End your answer with (source: full text)."
+        )
+        return {"focused_context": focused_context, "focused_question": focused_question}
+
+    # pending → resolve to "direct" or "general"
     context, sources_used = _build_chat_context(req)
-
-    # Fast path: simple factual queries answered directly without LLM
     direct = _try_direct_answer(req)
     if direct is not None:
-        return {"answer": direct, "sources_used": sources_used}
+        return {
+            "route": "direct",
+            "context": context,
+            "sources_used": sources_used,
+            "answer": direct,
+        }
+    return {"route": "general", "context": context, "sources_used": sources_used}
 
-    history = req.history  # already validated as list[dict[str, str]] by Pydantic
+
+async def _graph_generate_answer(state: _ChatGraphState) -> dict:
+    route = state["route"]
+    provider = state["provider"]
+    credential = state["credential"]
+    req = state["req"]
+
+    if route == "numeric":
+        context = state["focused_context"]
+        question = state["focused_question"]
+        history: list[dict[str, str]] = []
+        sources: list[str] = ["full_text"]
+    else:  # general
+        context = state["context"]
+        question = req.question
+        history = req.history
+        sources = state["sources_used"]
 
     try:
         if provider == "ollama":
-            answer = await _call_ollama(credential, context, req.question, history)
+            answer = await _call_ollama(credential, context, question, history)
         elif provider == "gemini":
-            answer = await _call_gemini(credential, context, req.question, history)
+            answer = await _call_gemini(credential, context, question, history)
         else:
-            answer = await _call_openai(credential, context, req.question, history)
+            answer = await _call_openai(credential, context, question, history)
     except Exception as exc:
-        print(f"AIRA Assistant network error ({provider}): {type(exc).__name__}")
+        print(f"AIRA graph error ({provider}): {type(exc).__name__}")
         return {
             "answer": (
                 f"Could not reach the {provider.capitalize()} service. "
@@ -2684,7 +2814,28 @@ async def chat(req: ChatRequest):
             "sources_used": [],
         }
 
-    return {"answer": answer, "sources_used": sources_used}
+    return {"answer": answer, "sources_used": sources}
+
+
+def _after_routing(state: _ChatGraphState) -> str:
+    return END if state["route"] == "no_provider" else "build_context"
+
+
+def _after_context(state: _ChatGraphState) -> str:
+    if state["route"] in ("direct", "numeric_no_text", "numeric_no_candidates"):
+        return END
+    return "generate_answer"
+
+
+_chat_graph_builder = StateGraph(_ChatGraphState)
+_chat_graph_builder.add_node("route_question", _graph_route_question)
+_chat_graph_builder.add_node("build_context", _graph_build_context)
+_chat_graph_builder.add_node("generate_answer", _graph_generate_answer)
+_chat_graph_builder.add_edge(START, "route_question")
+_chat_graph_builder.add_conditional_edges("route_question", _after_routing)
+_chat_graph_builder.add_conditional_edges("build_context", _after_context)
+_chat_graph_builder.add_edge("generate_answer", END)
+_chat_graph = _chat_graph_builder.compile()
 
 
 # ── Semantic Search ───────────────────────────────────────────────────────────
@@ -2702,7 +2853,7 @@ def _get_qdrant_client() -> Any:
         port = int(os.getenv("QDRANT_PORT", "6333"))
         api_key = os.getenv("QDRANT_API_KEY") or None
         use_https = os.getenv("QDRANT_HTTPS", "false").lower() in ("1", "true", "yes")
-        _qdrant_client = QdrantClient(host=host, port=port, api_key=api_key, https=use_https)
+        _qdrant_client = QdrantClient(host=host, port=port, api_key=api_key, https=use_https, timeout=60)
     return _qdrant_client
 
 
