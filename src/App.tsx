@@ -1200,19 +1200,17 @@ function App() {
                 <button className={`toggle-btn${graphView === "3D" ? " active" : ""}`} onClick={() => setGraphView("3D")}>3D</button>
               </div>
             )}
-            <div className="view-toggle">
-              <a
-                className="toggle-btn"
-                href="https://z0xy470n.forms.app/untitled-form"
-                target="_blank"
-                rel="noreferrer"
-              >
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ display: "inline-block", verticalAlign: "middle", marginRight: 5, marginBottom: 1 }}>
-                  <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-                </svg>
-                Feedback
-              </a>
-            </div>
+            <a
+              className="search-btn"
+              href="https://z0xy470n.forms.app/untitled-form"
+              target="_blank"
+              rel="noreferrer"
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ display: "inline-block", verticalAlign: "middle", marginRight: 5, marginBottom: 1 }}>
+                <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+              </svg>
+              Feedback
+            </a>
           </div>
         </header>
 
