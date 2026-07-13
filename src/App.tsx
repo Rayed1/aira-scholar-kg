@@ -274,9 +274,9 @@ function App() {
   const [selectedNode, setSelectedNode] = useState<NodeInfo | null>(null);
   const [searchTerm, setSearchTerm] = useState("");
   const [isLoading, setIsLoading] = useState(false);
-  const [fromYear, setFromYear] = useState("");
-  const [toYear, setToYear] = useState("");
-  const [resultLimit, setResultLimit] = useState("");
+  const [fromYear, setFromYear] = useState("2020");
+  const [toYear, setToYear] = useState("2026");
+  const [resultLimit, setResultLimit] = useState("100");
   const [graphView, setGraphView] = useState<"2D" | "3D">("2D");
   const [activeFilter, setActiveFilter] = useState<FilterType>("All");
   const [statusMessage, setStatusMessage] = useState("");
@@ -1084,7 +1084,7 @@ function App() {
           <div className="filter-list">
             <a
               className="export-btn"
-              href="https://cloud.langfuse.com/project/cmrev396w0134ad0d4eset9mr/traces"
+              href="http://128.214.253.109:3000/project/cmri7j893000bpf07s0hn52f8/traces"
               target="_blank"
               rel="noreferrer"
             >
@@ -1177,12 +1177,12 @@ function App() {
             />
             {searchMode === "keyword" && (
               <>
-                <input className="year-input" value={fromYear} onChange={(e) => setFromYear(e.target.value)} placeholder="e.g. 2020" />
+                <input className="year-input" value={fromYear} onChange={(e) => setFromYear(e.target.value)} />
                 <span className="year-sep">–</span>
-                <input className="year-input" value={toYear} onChange={(e) => setToYear(e.target.value)} placeholder="e.g. 2026" />
+                <input className="year-input" value={toYear} onChange={(e) => setToYear(e.target.value)} />
               </>
             )}
-            <input className="limit-input" value={resultLimit} onChange={(e) => setResultLimit(e.target.value)} placeholder="e.g. 50" />
+            <input className="limit-input" value={resultLimit} onChange={(e) => setResultLimit(e.target.value)} />
             <button
               className="search-btn"
               onClick={() => { if (searchMode === "semantic") loadSemanticSearch(); else void loadGraph(searchTerm); }}
@@ -1200,19 +1200,17 @@ function App() {
                 <button className={`toggle-btn${graphView === "3D" ? " active" : ""}`} onClick={() => setGraphView("3D")}>3D</button>
               </div>
             )}
-            <div className="view-toggle">
-              <a
-                className="toggle-btn"
-                href="https://z0xy470n.forms.app/untitled-form"
-                target="_blank"
-                rel="noreferrer"
-              >
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ display: "inline-block", verticalAlign: "middle", marginRight: 5, marginBottom: 1 }}>
-                  <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-                </svg>
-                Feedback
-              </a>
-            </div>
+            <a
+              className="search-btn"
+              href="https://z0xy470n.forms.app/untitled-form"
+              target="_blank"
+              rel="noreferrer"
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ display: "inline-block", verticalAlign: "middle", marginRight: 5, marginBottom: 1 }}>
+                <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+              </svg>
+              Feedback
+            </a>
           </div>
         </header>
 
@@ -1299,9 +1297,7 @@ function App() {
                 <div className="graph-onboarding-msg">
                   <p className="graph-onboarding-heading">Get started</p>
                   <ul>
-                    <li>Type a topic, author, or paper title in the search bar</li>
-                    <li>Set a year range</li>
-                    <li>Choose how many papers to load, then click Search</li>
+                    <li>Type a topic, author, or paper title in the search bar, then click Search</li>
                   </ul>
                 </div>
               </div>
