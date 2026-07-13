@@ -274,9 +274,9 @@ function App() {
   const [selectedNode, setSelectedNode] = useState<NodeInfo | null>(null);
   const [searchTerm, setSearchTerm] = useState("");
   const [isLoading, setIsLoading] = useState(false);
-  const [fromYear, setFromYear] = useState("");
-  const [toYear, setToYear] = useState("");
-  const [resultLimit, setResultLimit] = useState("");
+  const [fromYear, setFromYear] = useState("2020");
+  const [toYear, setToYear] = useState("2026");
+  const [resultLimit, setResultLimit] = useState("100");
   const [graphView, setGraphView] = useState<"2D" | "3D">("2D");
   const [activeFilter, setActiveFilter] = useState<FilterType>("All");
   const [statusMessage, setStatusMessage] = useState("");
@@ -1177,12 +1177,12 @@ function App() {
             />
             {searchMode === "keyword" && (
               <>
-                <input className="year-input" value={fromYear} onChange={(e) => setFromYear(e.target.value)} placeholder="e.g. 2020" />
+                <input className="year-input" value={fromYear} onChange={(e) => setFromYear(e.target.value)} />
                 <span className="year-sep">–</span>
-                <input className="year-input" value={toYear} onChange={(e) => setToYear(e.target.value)} placeholder="e.g. 2026" />
+                <input className="year-input" value={toYear} onChange={(e) => setToYear(e.target.value)} />
               </>
             )}
-            <input className="limit-input" value={resultLimit} onChange={(e) => setResultLimit(e.target.value)} placeholder="e.g. 50" />
+            <input className="limit-input" value={resultLimit} onChange={(e) => setResultLimit(e.target.value)} />
             <button
               className="search-btn"
               onClick={() => { if (searchMode === "semantic") loadSemanticSearch(); else void loadGraph(searchTerm); }}
@@ -1299,9 +1299,7 @@ function App() {
                 <div className="graph-onboarding-msg">
                   <p className="graph-onboarding-heading">Get started</p>
                   <ul>
-                    <li>Type a topic, author, or paper title in the search bar</li>
-                    <li>Set a year range</li>
-                    <li>Choose how many papers to load, then click Search</li>
+                    <li>Type a topic, author, or paper title in the search bar, then click Search</li>
                   </ul>
                 </div>
               </div>
