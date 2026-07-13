@@ -367,6 +367,7 @@ body {
   white-space: nowrap;
   flex-shrink: 0;
   transition: background 0.15s;
+  text-decoration: none;
 }
 
 .search-btn:hover:not(:disabled) { background: #4752d8; }
@@ -1122,8 +1123,8 @@ body {
   bottom: 68px;
   right: 24px;
   z-index: 500;
-  width: 400px;
-  max-height: 540px;
+  width: 420px;
+  max-height: 70vh;
   display: flex;
   flex-direction: column;
   background: #0d0d10;
@@ -1276,7 +1277,6 @@ body {
 .chat-popup-messages {
   flex: 1;
   min-height: 0;
-  max-height: 280px;
   padding: 10px 14px;
 }
 
@@ -1312,7 +1312,6 @@ body {
 }
 
 .chat-messages {
-  max-height: 240px;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
